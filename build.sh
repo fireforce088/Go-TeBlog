@@ -63,7 +63,7 @@ fi
 # 编译后台
 if [ -f "$CUR_DIR/admin.go" ]; then
     echo "开始编译后台服务 (admin.go)..."
-    go build -o "$CUR_DIR/admin_app" "$CUR_DIR/admin.go"
+    go build -o "$CUR_DIR/admin_app" "$CUR_DIR/admin.go" "$CUR_DIR/admin_helpers.go"
     echo "后台服务编译成功"
 elif [ -f "$CUR_DIR/admin_app" ]; then
     echo "未发现 admin.go，将使用现有的二进制文件 admin_app"

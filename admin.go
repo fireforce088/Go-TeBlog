@@ -22,8 +22,6 @@ import (
 	"sync"
 	"time"
 
-	"syscall"
-
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	_ "modernc.org/sqlite"
@@ -303,9 +301,11 @@ func main() {
 	})
 	r.LoadHTMLGlob("templates/admin/*")
 
+	loginLimiter := newLoginAttemptLimiter(5, 10*time.Minute, 10*time.Minute)
+
 	// Middleware for simple cookie auth
 	authMiddleware := func(c *gin.Context) {
-		sessionID, err := c.Cookie("te_auth")
+		sessionID, err := c.Cookie(adminSessionCookieName)
 		if err != nil {
 			c.Redirect(http.StatusFound, adminPath+"/login")
 			c.Abort()
@@ -321,7 +321,7 @@ func main() {
 			if err == nil {
 				db.Exec("DELETE FROM go_sessions WHERE session_id = ?", sessionID)
 			}
-			c.SetCookie("te_auth", "", -1, "/", "", false, true)
+			clearAdminSessionCookie(c)
 			c.Redirect(http.StatusFound, adminPath+"/login")
 			c.Abort()
 			return
@@ -329,7 +329,7 @@ func main() {
 
 		// Update activity time (sliding window)
 		db.Exec("UPDATE go_sessions SET created_at = ? WHERE session_id = ?", time.Now().Unix(), sessionID)
-		c.SetCookie("te_auth", sessionID, int(timeout), "/", "", false, true)
+		setAdminSessionCookie(c, sessionID, int(timeout))
 
 		// Fetch user group
 		var userGroup string
@@ -370,13 +370,23 @@ func main() {
 	})
 
 	r.POST(adminPath+"/login", func(c *gin.Context) {
-		username := c.PostForm("username")
+		username := strings.TrimSpace(c.PostForm("username"))
 		password := c.PostForm("password")
+		attemptKey := loginAttemptKey(c.ClientIP(), username)
+		if allowed, retryAfter := loginLimiter.Allow(attemptKey, time.Now()); !allowed {
+			c.HTML(http.StatusTooManyRequests, "admin_error.html", gin.H{
+				"AdminPath":    adminPath,
+				"ErrorTitle":   "登录过于频繁",
+				"ErrorMessage": fmt.Sprintf("失败次数过多，请 %d 秒后再试。", retryAfter),
+			})
+			return
+		}
 
 		var storedHash string
 		err := db.QueryRow("SELECT password FROM typecho_users WHERE name=?", username).Scan(&storedHash)
 
 		if err == nil && checkTypechoHash(password, storedHash) {
+			loginLimiter.RecordSuccess(attemptKey)
 			timeout := getOptionInt(db, "sessionTimeout", 30) * 60
 			// Cleanup old sessions
 			db.Exec("DELETE FROM go_sessions WHERE created_at < ?", time.Now().Unix()-int64(timeout))
@@ -397,9 +407,10 @@ func main() {
 				})
 				return
 			}
-			c.SetCookie("te_auth", sessionID, timeout, "/", "", false, true)
+			setAdminSessionCookie(c, sessionID, timeout)
 			c.Redirect(http.StatusFound, adminPath+"/dashboard")
 		} else {
+			loginLimiter.RecordFailure(attemptKey, time.Now())
 			c.HTML(http.StatusUnauthorized, "admin_error.html", gin.H{
 				"AdminPath":    adminPath,
 				"ErrorTitle":   "登录失败",
@@ -622,34 +633,7 @@ func main() {
 		runtime.ReadMemStats(&m)
 		memUsed := formatMem(float64(m.Alloc) / (1024 * 1024))
 
-		var totalMem int
-		var memFree string
-		var si syscall.Sysinfo_t
-		if err := syscall.Sysinfo(&si); err == nil {
-			// 将字节转换为 GB，并取整（向上取整以补偿内核占用空间）
-			ramBytes := float64(si.Totalram) * float64(si.Unit)
-			totalMem = int((ramBytes + (512 * 1024 * 1024)) / (1024 * 1024 * 1024))
-			// 默认使用 syscall 的 Freeram（跨平台兼容）
-			memFree = formatMem(float64(si.Freeram) * float64(si.Unit) / (1024 * 1024))
-		}
-
-		// Linux 上尝试获取 MemAvailable（更准确的可用内存，包含 buffer/cache）
-		if runtime.GOOS == "linux" {
-			if data, err := os.ReadFile("/proc/meminfo"); err == nil {
-				lines := strings.Split(string(data), "\n")
-				for _, line := range lines {
-					if strings.HasPrefix(line, "MemAvailable:") {
-						parts := strings.Fields(line)
-						if len(parts) >= 2 {
-							if kb, err := strconv.ParseInt(parts[1], 10, 64); err == nil {
-								memFree = formatMem(float64(kb) / 1024)
-							}
-							break
-						}
-					}
-				}
-			}
-		}
+		totalMem, memFree := systemMemorySummary(formatMem)
 
 		// 目录占用统计函数
 		getDirSize := func(path string) float64 {
@@ -663,28 +647,20 @@ func main() {
 			return float64(size) / (1024 * 1024)
 		}
 
-		// 剩余磁盘空间 (/)
-		var diskFree string
-		var fs syscall.Statfs_t
-		if err := syscall.Statfs("/", &fs); err == nil {
-			free := float64(fs.Bavail*uint64(fs.Bsize)) / (1024 * 1024 * 1024)
-			total := float64(fs.Blocks*uint64(fs.Bsize)) / (1024 * 1024 * 1024)
-			diskFree = fmt.Sprintf("%.1f GB 可用 / %.1f GB 总计", free, total)
-		} else {
-			diskFree = "获取失败"
-		}
+		// 剩余磁盘空间
+		diskFree := diskFreeSummary()
 
 		// 系统负载
-		var sysLoad string
-		if loadData, err := os.ReadFile("/proc/loadavg"); err == nil {
-			parts := strings.Fields(string(loadData))
-			if len(parts) >= 3 {
-				sysLoad = fmt.Sprintf("%s / %s / %s (1/5/15 min)", parts[0], parts[1], parts[2])
-			} else {
-				sysLoad = "解析失败"
+		sysLoad := systemLoadSummary()
+		if runtime.GOOS == "linux" {
+			if loadData, err := os.ReadFile("/proc/loadavg"); err == nil {
+				parts := strings.Fields(string(loadData))
+				if len(parts) >= 3 {
+					sysLoad = fmt.Sprintf("%s / %s / %s (1/5/15 min)", parts[0], parts[1], parts[2])
+				} else {
+					sysLoad = "解析失败"
+				}
 			}
-		} else {
-			sysLoad = "不支持 (Linux)"
 		}
 
 		cfShieldActive := getOption(db, "cfShieldActive", "0") == "1"
@@ -753,11 +729,11 @@ func main() {
 	})
 
 	admin.GET("/logout", func(c *gin.Context) {
-		sessionID, _ := c.Cookie("te_auth")
+		sessionID, _ := c.Cookie(adminSessionCookieName)
 		if sessionID != "" {
 			db.Exec("DELETE FROM go_sessions WHERE session_id = ?", sessionID)
 		}
-		c.SetCookie("te_auth", "", -1, "/", "", false, true)
+		clearAdminSessionCookie(c)
 		c.Redirect(http.StatusFound, adminPath+"/login")
 	})
 
@@ -1312,6 +1288,10 @@ func main() {
 
 	admin.GET("/posts", func(c *gin.Context) {
 		pageStr := c.DefaultQuery("page", "1")
+		filter := adminPostFilter{
+			Search: strings.TrimSpace(c.Query("q")),
+			Status: sanitizePostStatus(c.Query("status")),
+		}
 		page := 1
 		fmt.Sscanf(pageStr, "%d", &page)
 		if page < 1 {
@@ -1352,13 +1332,15 @@ func main() {
 			}
 		}
 
-		if group == "visitor" {
-			db.QueryRow("SELECT COUNT(*) FROM typecho_contents WHERE type='post' AND status='publish'").Scan(&total)
-			rows, err = db.Query("SELECT cid, title, created, status FROM typecho_contents WHERE type='post' AND status='publish' ORDER BY "+orderBy+" LIMIT ? OFFSET ?", pageSize, offset)
-		} else {
-			db.QueryRow("SELECT COUNT(*) FROM typecho_contents WHERE type='post'").Scan(&total)
-			rows, err = db.Query("SELECT cid, title, created, status FROM typecho_contents WHERE type='post' ORDER BY "+orderBy+" LIMIT ? OFFSET ?", pageSize, offset)
+		whereSQL, queryArgs := buildPostFilterWhere(filter, group == "visitor")
+		countSQL := "SELECT COUNT(*) FROM typecho_contents" + whereSQL
+		selectSQL := "SELECT cid, title, created, status FROM typecho_contents" + whereSQL + " ORDER BY " + orderBy + " LIMIT ? OFFSET ?"
+		if err := db.QueryRow(countSQL, queryArgs...).Scan(&total); err != nil {
+			c.String(500, err.Error())
+			return
 		}
+		listArgs := append(append([]interface{}{}, queryArgs...), pageSize, offset)
+		rows, err = db.Query(selectSQL, listArgs...)
 
 		if err != nil {
 			c.String(500, err.Error())
@@ -1384,22 +1366,29 @@ func main() {
 		totalPages := (total + pageSize - 1) / pageSize
 		username, _ := c.Get("username")
 		c.HTML(http.StatusOK, "admin_posts.html", gin.H{
-			"Username":    username,
-			"UserGroup":   group,
-			"Posts":       posts,
-			"Tab":         "posts",
-			"CurrentPage": page,
-			"TotalPages":  totalPages,
-			"HasPrev":     page > 1,
-			"HasNext":     page < totalPages,
-			"PrevPage":    page - 1,
-			"NextPage":    page + 1,
+			"Username":     username,
+			"UserGroup":    group,
+			"Posts":        posts,
+			"SearchQuery":  filter.Search,
+			"StatusFilter": filter.Status,
+			"QuerySuffix":  adminListQuerySuffix(map[string]string{"q": filter.Search, "status": filter.Status}),
+			"Tab":          "posts",
+			"CurrentPage":  page,
+			"TotalPages":   totalPages,
+			"HasPrev":      page > 1,
+			"HasNext":      page < totalPages,
+			"PrevPage":     page - 1,
+			"NextPage":     page + 1,
 		})
 	})
 
 	// Comment Management with Pagination
 	admin.GET("/comments", func(c *gin.Context) {
 		pageStr := c.DefaultQuery("page", "1")
+		filter := adminCommentFilter{
+			Search: strings.TrimSpace(c.Query("q")),
+			Status: sanitizeCommentStatus(c.Query("status")),
+		}
 		page := 1
 		fmt.Sscanf(pageStr, "%d", &page)
 		if page < 1 {
@@ -1407,16 +1396,26 @@ func main() {
 		}
 		pageSize := 20
 		offset := (page - 1) * pageSize
-
 		var total int
-		db.QueryRow("SELECT COUNT(*) FROM typecho_comments").Scan(&total)
 
-		rows, err := db.Query(`
+		whereSQL, queryArgs := buildCommentFilterWhere(filter)
+		countSQL := `
+			SELECT COUNT(*)
+			FROM typecho_comments c
+			LEFT JOIN typecho_contents p ON p.cid = c.cid AND p.type = 'post'` + whereSQL
+		if err := db.QueryRow(countSQL, queryArgs...).Scan(&total); err != nil {
+			c.String(500, err.Error())
+			return
+		}
+
+		selectSQL := `
 			SELECT c.coid, c.cid, c.parent, c.author, c.text, c.status, c.created, COALESCE(p.title, '')
 			FROM typecho_comments c
-			LEFT JOIN typecho_contents p ON p.cid = c.cid AND p.type = 'post'
+			LEFT JOIN typecho_contents p ON p.cid = c.cid AND p.type = 'post'` + whereSQL + `
 			ORDER BY c.created DESC, c.coid DESC
-			LIMIT ? OFFSET ?`, pageSize, offset)
+			LIMIT ? OFFSET ?`
+		listArgs := append(append([]interface{}{}, queryArgs...), pageSize, offset)
+		rows, err := db.Query(selectSQL, listArgs...)
 		if err != nil {
 			c.String(500, err.Error())
 			return
@@ -1454,15 +1453,18 @@ func main() {
 		totalPages := (total + pageSize - 1) / pageSize
 		username, _ := c.Get("username")
 		c.HTML(http.StatusOK, "admin_comments.html", gin.H{
-			"Username":    username,
-			"Comments":    comments,
-			"Tab":         "comments",
-			"CurrentPage": page,
-			"TotalPages":  totalPages,
-			"HasPrev":     page > 1,
-			"HasNext":     page < totalPages,
-			"PrevPage":    page - 1,
-			"NextPage":    page + 1,
+			"Username":     username,
+			"Comments":     comments,
+			"SearchQuery":  filter.Search,
+			"StatusFilter": filter.Status,
+			"QuerySuffix":  adminListQuerySuffix(map[string]string{"q": filter.Search, "status": filter.Status}),
+			"Tab":          "comments",
+			"CurrentPage":  page,
+			"TotalPages":   totalPages,
+			"HasPrev":      page > 1,
+			"HasNext":      page < totalPages,
+			"PrevPage":     page - 1,
+			"NextPage":     page + 1,
 		})
 	})
 
@@ -1488,8 +1490,9 @@ func main() {
 			querySQL += " AND p.status='publish'"
 		}
 		if searchQuery != "" {
-			querySQL += " AND p.title LIKE ?"
-			queryArgs = append(queryArgs, "%"+searchQuery+"%")
+			querySQL += " AND (p.title LIKE ? OR a.title LIKE ? OR a.text LIKE ?)"
+			like := "%" + searchQuery + "%"
+			queryArgs = append(queryArgs, like, like, like)
 		}
 		querySQL += `
 			ORDER BY a.created DESC, a.cid DESC`
@@ -2598,8 +2601,8 @@ func main() {
 		})
 	})
 
-	log.Println("Admin Server starting on 127.0.0.1:8191")
-	r.Run("127.0.0.1:8191")
+	log.Println("Admin Server starting on 0.0.0.0:8191")
+	r.Run("0.0.0.0:8191")
 }
 
 func checkTypechoHash(password, hash string) bool {

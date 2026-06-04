@@ -358,6 +358,64 @@
             display: inline;
         }
 
+        .toolbar {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            margin-bottom: 20px;
+        }
+
+        .filter-form {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            flex-wrap: wrap;
+        }
+
+        .filter-form input,
+        .filter-form select {
+            height: 36px;
+            border: 1px solid #e2e8f0;
+            border-radius: 8px;
+            padding: 0 12px;
+            background: #fff;
+            color: #334155;
+            outline: none;
+            font-size: 14px;
+            box-sizing: border-box;
+        }
+
+        .filter-form input {
+            width: 240px;
+        }
+
+        .filter-form input:focus,
+        .filter-form select:focus {
+            border-color: #0984e3;
+        }
+
+        .btn-filter {
+            height: 36px;
+            border: 1px solid #0984e3;
+            background: #0984e3;
+            color: #fff;
+            border-radius: 8px;
+            padding: 0 14px;
+            cursor: pointer;
+            font-size: 13px;
+        }
+
+        .clear-filter {
+            color: #64748b;
+            text-decoration: none;
+            font-size: 13px;
+        }
+
+        .clear-filter:hover {
+            color: #0984e3;
+        }
+
         .action-group {
             display: inline-flex;
             align-items: center;
@@ -405,7 +463,24 @@
     {{template "admin_topbar" .}}
 
     <div class="content">
-        <a href="{{adminPath}}/edit/new" class="btn btn-new">发布新文章</a>
+        <div class="toolbar">
+            <a href="{{adminPath}}/edit/new" class="btn btn-new" style="margin-bottom:0;">发布新文章</a>
+            <form method="GET" action="{{adminPath}}/posts" class="filter-form">
+                <input type="text" name="q" value="{{.SearchQuery}}" placeholder="按标题搜索">
+                <select name="status">
+                    <option value="" {{if eq .StatusFilter ""}}selected{{end}}>全部状态</option>
+                    <option value="publish" {{if eq .StatusFilter "publish"}}selected{{end}}>已发布</option>
+                    <option value="draft" {{if eq .StatusFilter "draft"}}selected{{end}}>草稿</option>
+                    <option value="hidden" {{if eq .StatusFilter "hidden"}}selected{{end}}>隐藏</option>
+                    <option value="private" {{if eq .StatusFilter "private"}}selected{{end}}>私密</option>
+                    <option value="waiting" {{if eq .StatusFilter "waiting"}}selected{{end}}>待审核</option>
+                </select>
+                <button type="submit" class="btn-filter">筛选</button>
+                {{if or .SearchQuery .StatusFilter}}
+                <a href="{{adminPath}}/posts" class="clear-filter">清空</a>
+                {{end}}
+            </form>
+        </div>
         <table>
             <thead>
                 <tr>
@@ -452,7 +527,7 @@
         {{if gt .TotalPages 1}}
         <div class="pager">
             {{if .HasPrev}}
-            <a href="?page={{.PrevPage}}">&lt;</a>
+            <a href="?page={{.PrevPage}}{{.QuerySuffix}}">&lt;</a>
             {{else}}
             <span class="nav-arrow">&lt;</span>
             {{end}}
@@ -461,12 +536,12 @@
                 {{if eq $p $.CurrentPage}}
                 <span class="active">{{$p}}</span>
                 {{else}}
-                <a href="?page={{$p}}">{{$p}}</a>
+                <a href="?page={{$p}}{{$.QuerySuffix}}">{{$p}}</a>
                 {{end}}
             {{end}}
 
             {{if .HasNext}}
-            <a href="?page={{.NextPage}}">&gt;</a>
+            <a href="?page={{.NextPage}}{{.QuerySuffix}}">&gt;</a>
             {{else}}
             <span class="nav-arrow">&gt;</span>
             {{end}}
@@ -482,7 +557,7 @@
                 var page = parseInt(document.getElementById('gotoPage').value);
                 var total = {{.TotalPages}};
                 if (page >= 1 && page <= total) {
-                    window.location.href = "?page=" + page;
+                    window.location.href = '?page=' + page + '{{.QuerySuffix}}';
                 }
             }
         </script>
