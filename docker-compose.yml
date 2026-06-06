@@ -1,0 +1,14 @@
+services:
+  go-teblog:
+    build: .
+    image: go-teblog:local
+    container_name: go-teblog
+    restart: unless-stopped
+    ports:
+      - "8190:8190"
+    environment:
+      TZ: Asia/Shanghai
+      INIT_ADMIN_USER: admin
+      INIT_ADMIN_PASSWORD: admin
+    volumes:
+      - ./data:/data

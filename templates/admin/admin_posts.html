@@ -1,0 +1,627 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <meta charset="UTF-8">
+    <title>文章管理 - Go-TeBlog</title>
+    <link rel="stylesheet" href="/blog/usr/themes/default/css/font-awesome.min.css">
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+            margin: 0;
+            display: flex;
+            background: #f1f5f9;
+            color: #1e293b;
+        }
+
+        .sidebar {
+            width: 240px;
+            background: #2d3436;
+            color: #dfe6e9;
+            height: 100vh;
+            padding: 20px;
+            box-shadow: 2px 0 10px rgba(0, 0, 0, 0.1);
+            z-index: 10;
+            position: fixed;
+            left: 0;
+            top: 0;
+            box-sizing: border-box;
+            display: flex;
+            flex-direction: column;
+        }
+
+        .sidebar h3 {
+            color: #fff;
+            margin: 10px 0 30px 10px;
+            font-size: 1.25em;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .sidebar h3 i {
+            color: #0984e3;
+        }
+
+        .nav-label {
+            font-size: 11px;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: #636e72;
+            margin: 20px 0 10px 10px;
+        }
+
+        .sidebar a {
+            display: flex;
+            align-items: center;
+            padding: 10px 15px;
+            color: #b2bec3;
+            text-decoration: none;
+            border-radius: 8px;
+            margin-bottom: 4px;
+            transition: all 0.2s;
+            font-size: 14px;
+        }
+
+        .sidebar a:hover {
+            color: #fff;
+            background: rgba(255, 255, 255, 0.05);
+        }
+
+        .sidebar a.active {
+            background: #0984e3;
+            color: white;
+            font-weight: 600;
+            box-shadow: 0 4px 6px rgba(9, 132, 227, 0.2);
+        }
+
+        .sidebar a i {
+            margin-right: 12px;
+            width: 20px;
+            text-align: center;
+            font-size: 16px;
+        }
+
+        .sidebar-divider {
+            height: 1px;
+            background: rgba(255, 255, 255, 0.05);
+            margin: 10px 0;
+        }
+
+        .content {
+            flex: 1;
+            padding: 40px;
+            margin-left: 240px;
+            min-height: 100vh;
+            box-sizing: border-box;
+            padding-top: 85px;
+        }
+
+        .top-bar {
+            position: fixed;
+            top: 0;
+            left: 240px;
+            right: 0;
+            height: 55px;
+            background: rgba(255, 255, 255, 0.8);
+            backdrop-filter: blur(8px);
+            box-shadow: 0 1px 2px rgba(0, 0, 0, 0.05);
+            display: flex;
+            align-items: center;
+            justify-content: flex-end;
+            padding: 0 40px;
+            z-index: 5;
+        }
+
+        .user-menu {
+            position: relative;
+            cursor: pointer;
+            padding: 8px 12px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            border-radius: 50px;
+            transition: background 0.2s;
+            font-size: 14px;
+            color: #334155;
+            border: 1px solid #e2e8f0;
+        }
+
+        .user-menu:hover {
+            background: #fff;
+            border-color: #cbd5e1;
+        }
+
+        .user-menu .dropdown {
+            position: absolute;
+            top: 100%;
+            margin-top: 5px;
+            left: 0;
+            background: #fff;
+            box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.1);
+            border: 1px solid #e2e8f0;
+            border-radius: 12px;
+            min-width: 120px;
+            display: none;
+            flex-direction: column;
+            padding: 8px 0;
+            z-index: 100;
+        }
+
+        .user-menu.open .dropdown {
+            display: flex;
+        }
+
+        .dropdown a {
+            padding: 10px 20px;
+            text-decoration: none;
+            color: #475569;
+            font-size: 14px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .dropdown a:hover {
+            background: #f1f5f9;
+            color: #0f172a;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            background: white;
+            border-radius: 16px;
+            overflow: hidden;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05);
+            border: 1px solid #e2e8f0;
+        }
+
+        th,
+        td {
+            text-align: left;
+            padding: 15px 20px;
+            border-bottom: 1px solid #f1f5f9;
+        }
+
+        th {
+            background: #f8fafc;
+            font-weight: 600;
+            color: #64748b;
+            font-size: 13px;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }
+
+        .btn {
+            padding: 8px 16px;
+            border-radius: 8px;
+            text-decoration: none;
+            font-size: 13px;
+            font-weight: 500;
+            transition: all 0.2s;
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            border: none;
+            cursor: pointer;
+        }
+
+        .btn-edit {
+            background: #f1f5f9;
+            color: #475569;
+        }
+
+        .btn-edit:hover {
+            background: #e2e8f0;
+            color: #0f172a;
+        }
+
+        .btn-delete {
+            background: #fff1f2;
+            color: #e11d48;
+        }
+
+        .btn-delete:hover {
+            background: #ffe4e6;
+        }
+
+        .btn-new {
+            background: #0984e3;
+            color: white;
+            margin-bottom: 25px;
+            box-shadow: 0 4px 6px rgba(9, 132, 227, 0.2);
+        }
+
+        .btn-new:hover {
+            background: #0873c4;
+            transform: translateY(-1px);
+        }
+
+        .switch {
+            position: relative;
+            display: inline-block;
+            width: 40px;
+            height: 22px;
+        }
+
+        .switch input {
+            opacity: 0;
+            width: 0;
+            height: 0;
+        }
+
+        .slider {
+            position: absolute;
+            cursor: pointer;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background-color: #cbd5e1;
+            transition: .4s;
+            border-radius: 34px;
+        }
+
+        .slider:before {
+            position: absolute;
+            content: "";
+            height: 16px;
+            width: 16px;
+            left: 3px;
+            bottom: 3px;
+            background-color: white;
+            transition: .4s;
+            border-radius: 50%;
+        }
+
+        input:checked+.slider {
+            background-color: #3b82f6;
+        }
+
+        input:checked+.slider:before {
+            transform: translateX(18px);
+        }
+
+        .pager {
+            margin-top: 30px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+        }
+
+        .pager a,
+        .pager span.nav-arrow,
+        .pager span.active {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            min-width: 36px;
+            height: 36px;
+            padding: 0 6px;
+            border-radius: 8px;
+            background: white;
+            border: 1px solid #e2e8f0;
+            color: #475569;
+            text-decoration: none;
+            transition: all 0.2s;
+            font-size: 14px;
+            box-sizing: border-box;
+        }
+
+        .pager a:hover {
+            border-color: #0984e3;
+            color: #0984e3;
+            background: #f0f7ff;
+        }
+
+        .pager span.active {
+            background: #0984e3 !important;
+            color: #ffffff !important;
+            border-color: #0984e3 !important;
+            font-weight: 600;
+        }
+
+        .pager .nav-arrow {
+            color: #cbd5e1;
+            background: #f8fafc;
+            cursor: not-allowed;
+        }
+
+        .goto-box {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin-left: 15px;
+            font-size: 14px;
+            color: #64748b;
+        }
+
+        .goto-box input {
+            width: 50px;
+            height: 36px;
+            padding: 0 8px;
+            border: 1px solid #e2e8f0;
+            border-radius: 8px;
+            text-align: center;
+            outline: none;
+            transition: border-color 0.2s;
+        }
+
+        .goto-box input:focus {
+            border-color: #3b82f6;
+        }
+
+        .inline-form {
+            display: inline;
+        }
+
+        .toolbar {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            margin-bottom: 20px;
+        }
+
+        .filter-form {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            flex-wrap: wrap;
+        }
+
+        .filter-form input,
+        .filter-form select {
+            height: 36px;
+            border: 1px solid #e2e8f0;
+            border-radius: 8px;
+            padding: 0 12px;
+            background: #fff;
+            color: #334155;
+            outline: none;
+            font-size: 14px;
+            box-sizing: border-box;
+        }
+
+        .filter-form input {
+            width: 240px;
+        }
+
+        .filter-form input:focus,
+        .filter-form select:focus {
+            border-color: #0984e3;
+        }
+
+        .btn-filter {
+            height: 36px;
+            border: 1px solid #0984e3;
+            background: #0984e3;
+            color: #fff;
+            border-radius: 8px;
+            padding: 0 14px;
+            cursor: pointer;
+            font-size: 13px;
+        }
+
+        .clear-filter {
+            color: #64748b;
+            text-decoration: none;
+            font-size: 13px;
+        }
+
+        .clear-filter:hover {
+            color: #0984e3;
+        }
+
+        .action-group {
+            display: inline-flex;
+            align-items: center;
+            gap: 5px;
+        }
+
+        .icon-action-btn {
+            width: 26px;
+            height: 26px;
+            border-radius: 7px;
+            border: 1px solid #dbe4ea;
+            background: #f8fafc;
+            color: #64748b;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            text-decoration: none;
+            cursor: pointer;
+            transition: all 0.2s;
+            font-size: 12px;
+        }
+
+        .icon-action-btn:hover {
+            background: #f1f5f9;
+            border-color: #cbd5e1;
+            color: #334155;
+        }
+
+        .icon-action-btn.delete {
+            border-color: #f1d4da;
+            background: #fff7f8;
+            color: #be123c;
+        }
+
+        .icon-action-btn.delete:hover {
+            background: #fff1f2;
+            border-color: #fecdd3;
+            color: #9f1239;
+        }
+    </style>
+</head>
+
+<body>
+        {{template "admin_sidebar" .}}
+    {{template "admin_topbar" .}}
+
+    <div class="content">
+        <div class="toolbar">
+            <a href="{{adminPath}}/edit/new" class="btn btn-new" style="margin-bottom:0;">发布新文章</a>
+            <form method="GET" action="{{adminPath}}/posts" class="filter-form">
+                <input type="text" name="q" value="{{.SearchQuery}}" placeholder="按标题搜索">
+                <select name="status">
+                    <option value="" {{if eq .StatusFilter ""}}selected{{end}}>全部状态</option>
+                    <option value="publish" {{if eq .StatusFilter "publish"}}selected{{end}}>已发布</option>
+                    <option value="draft" {{if eq .StatusFilter "draft"}}selected{{end}}>草稿</option>
+                    <option value="hidden" {{if eq .StatusFilter "hidden"}}selected{{end}}>隐藏</option>
+                    <option value="private" {{if eq .StatusFilter "private"}}selected{{end}}>私密</option>
+                    <option value="waiting" {{if eq .StatusFilter "waiting"}}selected{{end}}>待审核</option>
+                </select>
+                <button type="submit" class="btn-filter">筛选</button>
+                {{if or .SearchQuery .StatusFilter}}
+                <a href="{{adminPath}}/posts" class="clear-filter">清空</a>
+                {{end}}
+            </form>
+        </div>
+        <table>
+            <thead>
+                <tr>
+                    <th>标题</th>
+                    <th>日期</th>
+                    <th>置顶</th>
+                    <th>状态</th>
+                    <th>操作</th>
+                </tr>
+            </thead>
+            <tbody>
+                {{range .Posts}}
+                <tr>
+                    <td>{{.Title}}</td>
+                    <td>{{.Created}}</td>
+                    <td style="text-align: center;">
+                        <i class="fa{{if .IsTop}}s{{else}}r{{end}} fa-star" 
+                           style="cursor: pointer; color: {{if .IsTop}}#f1c40f{{else}}#cbd5e1{{end}}; font-size: 1.2em;" 
+                           onclick="toggleTop({{.Cid}}, this)"></i>
+                    </td>
+                    <td>
+                        <label class="switch">
+                            <input type="checkbox" {{if eq .Status "publish" }}checked{{end}} onchange="toggleStatus({{.Cid}}, this)">
+                            <span class="slider"></span>
+                        </label>
+                    </td>
+                    <td>
+                        <div class="action-group">
+                            <a href="{{adminPath}}/edit/{{.Cid}}" class="icon-action-btn" title="编辑" aria-label="编辑">
+                                <i class="fas fa-pen"></i>
+                            </a>
+                            <form action="{{adminPath}}/post/delete/{{.Cid}}" method="POST" class="inline-form" onsubmit="return confirm('确定要删除这篇文章吗？删除后无法恢复！')">
+                                <button type="submit" class="icon-action-btn delete" title="删除" aria-label="删除">
+                                    <i class="fas fa-trash"></i>
+                                </button>
+                            </form>
+                        </div>
+                    </td>
+                </tr>
+                {{end}}
+            </tbody>
+        </table>
+
+        {{if gt .TotalPages 1}}
+        <div class="pager">
+            {{if .HasPrev}}
+            <a href="?page={{.PrevPage}}{{.QuerySuffix}}">&lt;</a>
+            {{else}}
+            <span class="nav-arrow">&lt;</span>
+            {{end}}
+
+            {{range $p := iterate 1 .TotalPages}}
+                {{if eq $p $.CurrentPage}}
+                <span class="active">{{$p}}</span>
+                {{else}}
+                <a href="?page={{$p}}{{$.QuerySuffix}}">{{$p}}</a>
+                {{end}}
+            {{end}}
+
+            {{if .HasNext}}
+            <a href="?page={{.NextPage}}{{.QuerySuffix}}">&gt;</a>
+            {{else}}
+            <span class="nav-arrow">&gt;</span>
+            {{end}}
+
+            <div class="goto-box">
+                <span>前往</span>
+                <input type="number" id="gotoPage" min="1" max="{{.TotalPages}}" value="{{.CurrentPage}}" onkeydown="if(event.key==='Enter')gotoPage()">
+                <span>页</span>
+            </div>
+        </div>
+        <script>
+            function gotoPage() {
+                var page = parseInt(document.getElementById('gotoPage').value);
+                var total = {{.TotalPages}};
+                if (page >= 1 && page <= total) {
+                    window.location.href = '?page=' + page + '{{.QuerySuffix}}';
+                }
+            }
+        </script>
+        {{end}}
+    </div>
+    <script>
+        function toggleTop(cid, icon) {
+            fetch('{{adminPath}}/post/toggle-top/' + cid, {
+                method: 'POST'
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.success) {
+                    if (data.isTop) {
+                        icon.className = 'fas fa-star';
+                        icon.style.color = '#f1c40f';
+                    } else {
+                        icon.className = 'far fa-star';
+                        icon.style.color = '#cbd5e1';
+                    }
+                    // 提示用户需要刷新才能看到排序变化
+                    console.log('置顶状态已更新');
+                } else {
+                    alert(data.message || '操作失败');
+                }
+            })
+            .catch(error => {
+                console.error('Error:', error);
+                alert('网络错误');
+            });
+        }
+
+        function toggleStatus(cid, checkbox) {
+            fetch('{{adminPath}}/post/toggle/' + cid, {
+                method: 'POST'
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (!data.success) {
+                    alert(data.message || '操作失败');
+                    checkbox.checked = !checkbox.checked;
+                }
+            })
+            .catch(error => {
+                console.error('Error:', error);
+                alert('网络错误');
+                checkbox.checked = !checkbox.checked;
+            });
+        }
+    </script>
+<script>
+document.addEventListener('DOMContentLoaded', function () {
+  const userMenu = document.querySelector('.user-menu');
+  if (userMenu) {
+    userMenu.addEventListener('click', function (e) {
+      e.stopPropagation();
+      userMenu.classList.toggle('open');
+    });
+    document.addEventListener('click', function () {
+      userMenu.classList.remove('open');
+    });
+  }
+});
+</script>
+</body>
+
+</html>

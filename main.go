@@ -1,0 +1,2656 @@
+package main
+
+import (
+	"bytes"
+	"database/sql"
+	"encoding/json"
+	"encoding/xml"
+	"fmt"
+	"html/template"
+	"io"
+	"log"
+	"net"
+	"net/http"
+	"net/http/httputil"
+	"net/url"
+	"os"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/gin-gonic/gin"
+	"github.com/yuin/goldmark"
+	"github.com/yuin/goldmark/extension"
+	"github.com/yuin/goldmark/renderer/html"
+	_ "modernc.org/sqlite"
+)
+
+type statsLog struct {
+	IP    string
+	UA    string
+	Path  string
+	IsBot int
+}
+
+var statsChan chan statsLog
+var statsWG sync.WaitGroup
+var systemTimeLocation = time.Local
+var skinThemeNamePattern = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
+var skinColorPattern = regexp.MustCompile(`(?i)^(#[0-9a-f]{3}|#[0-9a-f]{6}|#[0-9a-f]{8}|rgba?\([0-9.,%\s/+-]+\)|hsla?\([0-9.,%\s/+-]+\)|transparent|inherit|initial|unset|currentColor|[a-z]+)$`)
+var skinLengthPattern = regexp.MustCompile(`(?i)^(0|[0-9]+(?:\.[0-9]+)?)(px|rem|em|vw|vh|%)?$`)
+
+type commentAttemptLimiter struct {
+	mu       sync.Mutex
+	byIP     map[string][]int64
+	lastSeen map[string]int64
+	all      []int64
+	request  int64
+}
+
+var commentLimiter = &commentAttemptLimiter{
+	byIP:     make(map[string][]int64),
+	lastSeen: make(map[string]int64),
+}
+
+type cloudflareShieldManager struct {
+	db *sql.DB
+
+	mu               sync.Mutex
+	currentMinuteKey int64
+	currentMinuteCnt int
+	currentMinuteIPs map[string]int
+	currentMinuteHit map[string]string
+	cfgLoadedAt      int64
+	threshold        int
+	apiToken         string
+	authEmail        string
+	zoneID           string
+	restoreLevel     string
+	autoDisableMins  int
+	autoBlockIP      bool
+	shieldActive     bool
+	shieldUntil      int64
+	switching        bool
+	failCooldownTill int64
+}
+
+type cfBlockCandidate struct {
+	IP   string
+	Path string
+	Hits int
+}
+
+type cfBlockedIPRule struct {
+	IP     string `json:"ip"`
+	RuleID string `json:"rule_id"`
+}
+
+func newCloudflareShieldManager(db *sql.DB) *cloudflareShieldManager {
+	mgr := &cloudflareShieldManager{
+		db:               db,
+		threshold:        1000,
+		restoreLevel:     "medium",
+		autoDisableMins:  30,
+		currentMinuteIPs: make(map[string]int),
+		currentMinuteHit: make(map[string]string),
+	}
+
+	if getOption(db, "cfShieldActive", "0") == "1" {
+		mgr.shieldActive = true
+	}
+	mgr.shieldUntil = getOptionInt64(db, "cfShieldUntil", 0)
+
+	return mgr
+}
+
+func (m *cloudflareShieldManager) loadConfigLocked(now int64) {
+	// 限制配置读取频率，避免每个请求都查库
+	if now-m.cfgLoadedAt < 10 {
+		return
+	}
+	m.cfgLoadedAt = now
+
+	limit := getOptionInt(m.db, "cfRequestLimitPerMinute", 1000)
+	if limit < 1 {
+		limit = 1000
+	}
+
+	m.threshold = limit
+	m.apiToken = strings.TrimSpace(getOption(m.db, "cfApiToken", ""))
+	m.authEmail = strings.TrimSpace(getOption(m.db, "cfAuthEmail", ""))
+	m.zoneID = strings.TrimSpace(getOption(m.db, "cfZoneID", ""))
+	m.restoreLevel = sanitizeSecurityLevel(getOption(m.db, "cfRestoreSecurityLevel", "medium"))
+	m.autoBlockIP = getOption(m.db, "cfShieldAutoBlockIP", "0") == "1"
+	autoDisableMins := getOptionInt(m.db, "cfShieldAutoDisableMinutes", 30)
+	if autoDisableMins < 1 {
+		autoDisableMins = 30
+	}
+	m.autoDisableMins = autoDisableMins
+}
+
+func (m *cloudflareShieldManager) middleware(adminPath string) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		path := c.Request.URL.Path
+		if strings.HasPrefix(path, adminPath) {
+			c.Next()
+			return
+		}
+
+		now := time.Now().Unix()
+		minuteKey := now / 60
+
+		needEnable := false
+		triggerIP := ""
+		triggerPath := ""
+		blockCandidates := []cfBlockCandidate{}
+
+		m.mu.Lock()
+		m.loadConfigLocked(now)
+		if m.currentMinuteKey != minuteKey {
+			m.currentMinuteKey = minuteKey
+			m.currentMinuteCnt = 0
+			m.currentMinuteIPs = make(map[string]int)
+			m.currentMinuteHit = make(map[string]string)
+		}
+		m.currentMinuteCnt++
+		ip := clientIPFromRequest(c)
+		if ip != "" {
+			m.currentMinuteIPs[ip]++
+			if _, ok := m.currentMinuteHit[ip]; !ok {
+				path := c.Request.URL.Path
+				if path == "" {
+					path = "/"
+				}
+				m.currentMinuteHit[ip] = path
+			}
+		}
+
+		if !m.shieldActive &&
+			!m.switching &&
+			now >= m.failCooldownTill &&
+			m.apiToken != "" &&
+			m.zoneID != "" &&
+			m.currentMinuteCnt > m.threshold {
+			triggerIP, triggerPath = m.topMinuteSourceLocked()
+			blockCandidates = m.blockCandidatesLocked()
+			m.switching = true
+			needEnable = true
+		}
+		m.mu.Unlock()
+
+		if needEnable {
+			go m.enableShield(triggerIP, triggerPath, blockCandidates)
+		}
+
+		c.Next()
+	}
+}
+
+func (m *cloudflareShieldManager) topMinuteSourceLocked() (string, string) {
+	var topIP string
+	var topPath string
+	maxHits := 0
+	for ip, hits := range m.currentMinuteIPs {
+		if hits > maxHits {
+			maxHits = hits
+			topIP = ip
+			topPath = m.currentMinuteHit[ip]
+		}
+	}
+	if topPath == "" {
+		topPath = "/"
+	}
+	return topIP, topPath
+}
+
+func (m *cloudflareShieldManager) blockCandidatesLocked() []cfBlockCandidate {
+	minHits := m.threshold / 10
+	if minHits < 30 {
+		minHits = 30
+	}
+
+	candidates := make([]cfBlockCandidate, 0, len(m.currentMinuteIPs))
+	for ip, hits := range m.currentMinuteIPs {
+		if hits < minHits || !isBlockableIP(ip) {
+			continue
+		}
+		path := m.currentMinuteHit[ip]
+		if path == "" {
+			path = "/"
+		}
+		candidates = append(candidates, cfBlockCandidate{IP: ip, Path: path, Hits: hits})
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		return candidates[i].Hits > candidates[j].Hits
+	})
+	if len(candidates) > 10 {
+		candidates = candidates[:10]
+	}
+	return candidates
+}
+
+func isBlockableIP(ip string) bool {
+	parsed := net.ParseIP(strings.TrimSpace(ip))
+	if parsed == nil {
+		return false
+	}
+	return parsed.IsGlobalUnicast() && !parsed.IsPrivate() && !parsed.IsLoopback()
+}
+
+func clientIPFromRequest(c *gin.Context) string {
+	ip := strings.TrimSpace(c.GetHeader("CF-Connecting-IP"))
+	if ip != "" {
+		return ip
+	}
+
+	return strings.TrimSpace(c.ClientIP())
+}
+
+func (m *cloudflareShieldManager) enableShield(triggerIP, triggerPath string, blockCandidates []cfBlockCandidate) {
+	now := time.Now().Unix()
+
+	m.mu.Lock()
+	m.loadConfigLocked(now)
+	token := m.apiToken
+	authEmail := m.authEmail
+	zoneID := m.zoneID
+	autoDisableMins := m.autoDisableMins
+	autoBlockIP := m.autoBlockIP
+	if m.shieldActive || token == "" || zoneID == "" {
+		m.switching = false
+		m.mu.Unlock()
+		return
+	}
+	m.mu.Unlock()
+
+	err := updateCloudflareSecurityLevel(token, authEmail, zoneID, "under_attack")
+	if err != nil {
+		m.mu.Lock()
+		m.switching = false
+		m.failCooldownTill = time.Now().Unix() + 300
+		m.mu.Unlock()
+		return
+	}
+
+	expiresAt := time.Now().Add(time.Duration(autoDisableMins) * time.Minute).Unix()
+	setOption(m.db, "cfShieldActive", "1")
+	setOption(m.db, "cfShieldUntil", strconv.FormatInt(expiresAt, 10))
+	setOption(m.db, "cfShieldActivatedAt", strconv.FormatInt(now, 10))
+	logID := int64(0)
+	if strings.TrimSpace(triggerIP) != "" {
+		if strings.TrimSpace(triggerPath) == "" {
+			triggerPath = "/"
+		}
+		res, err := m.db.Exec("INSERT INTO go_cf_shield_logs (ip, path, ua, blocked_ips, created) VALUES (?, ?, ?, ?, ?)", triggerIP, triggerPath, "threshold-trigger", "", now)
+		if err != nil {
+			log.Printf("Cloudflare 五秒盾触发日志写入失败: %v", err)
+		} else if res != nil {
+			logID, _ = res.LastInsertId()
+		}
+	}
+	log.Printf("Cloudflare 五秒盾已开启，预计关闭时间: %s", time.Unix(expiresAt, 0).Format("2006-01-02 15:04:05"))
+
+	m.mu.Lock()
+	m.shieldActive = true
+	m.shieldUntil = expiresAt
+	m.switching = false
+	m.mu.Unlock()
+
+	if autoBlockIP && len(blockCandidates) > 0 {
+		go blockCloudflareIPs(m.db, logID, token, authEmail, zoneID, blockCandidates)
+	}
+}
+
+func blockCloudflareIPs(db *sql.DB, logID int64, token, authEmail, zoneID string, candidates []cfBlockCandidate) {
+	blockedRules := make([]cfBlockedIPRule, 0, len(candidates))
+	for i, candidate := range candidates {
+		if i > 0 {
+			time.Sleep(time.Second)
+		}
+		ruleID, err := blockCloudflareIP(token, authEmail, zoneID, candidate.IP, "Go-TeBlog 五秒盾自动拉黑")
+		if err != nil {
+			log.Printf("Cloudflare 五秒盾自动拉黑 IP 失败: %s: %v", candidate.IP, err)
+		} else {
+			blockedRules = append(blockedRules, cfBlockedIPRule{IP: candidate.IP, RuleID: ruleID})
+			log.Printf("Cloudflare 五秒盾已自动拉黑 IP: %s，分钟命中: %d", candidate.IP, candidate.Hits)
+		}
+	}
+	if db != nil && logID > 0 && len(blockedRules) > 0 {
+		blockedRulesJSON, err := json.Marshal(blockedRules)
+		if err != nil {
+			log.Printf("Cloudflare 五秒盾自动拉黑 IP 序列化失败: %v", err)
+			return
+		}
+		if _, err := db.Exec("UPDATE go_cf_shield_logs SET blocked_ips = ? WHERE id = ?", string(blockedRulesJSON), logID); err != nil {
+			log.Printf("Cloudflare 五秒盾自动拉黑 IP 写入失败: %v", err)
+		}
+	}
+}
+
+func (m *cloudflareShieldManager) disableShieldIfNeeded() {
+	now := time.Now().Unix()
+
+	m.mu.Lock()
+	m.loadConfigLocked(now)
+	token := m.apiToken
+	authEmail := m.authEmail
+	zoneID := m.zoneID
+	restoreLevel := m.restoreLevel
+	active := m.shieldActive
+	expiresAt := m.shieldUntil
+	switching := m.switching
+	if !active || switching || expiresAt == 0 || now < expiresAt || token == "" || zoneID == "" {
+		m.mu.Unlock()
+		return
+	}
+	m.switching = true
+	m.mu.Unlock()
+
+	err := updateCloudflareSecurityLevel(token, authEmail, zoneID, restoreLevel)
+	if err != nil {
+		m.mu.Lock()
+		m.switching = false
+		m.failCooldownTill = time.Now().Unix() + 300
+		m.mu.Unlock()
+		return
+	}
+
+	setOption(m.db, "cfShieldActive", "0")
+	setOption(m.db, "cfShieldUntil", "0")
+
+	log.Printf("Cloudflare 五秒盾已关闭，恢复等级: %s", restoreLevel)
+
+	m.mu.Lock()
+	m.shieldActive = false
+	m.shieldUntil = 0
+	m.switching = false
+	m.mu.Unlock()
+}
+
+func (m *cloudflareShieldManager) startAutoDisableWorker(stop <-chan struct{}) {
+	ticker := time.NewTicker(15 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			m.disableShieldIfNeeded()
+		case <-stop:
+			return
+		}
+	}
+}
+
+func sanitizeSecurityLevel(level string) string {
+	switch strings.TrimSpace(strings.ToLower(level)) {
+	case "essentially_off", "low", "medium", "high":
+		return strings.TrimSpace(strings.ToLower(level))
+	default:
+		return "medium"
+	}
+}
+
+func updateCloudflareSecurityLevel(apiToken, authEmail, zoneID, level string) error {
+	payload, _ := json.Marshal(map[string]string{
+		"value": level,
+	})
+
+	endpoint := fmt.Sprintf("https://api.cloudflare.com/client/v4/zones/%s/settings/security_level", zoneID)
+	req, err := http.NewRequest(http.MethodPatch, endpoint, bytes.NewBuffer(payload))
+	if err != nil {
+		return fmt.Errorf("构建 Cloudflare 请求失败: %w", err)
+	}
+	if authEmail != "" {
+		req.Header.Set("X-Auth-Email", authEmail)
+		req.Header.Set("X-Auth-Key", apiToken)
+	} else {
+		req.Header.Set("Authorization", "Bearer "+apiToken)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("Cloudflare 请求失败: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("Cloudflare 返回状态 %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	var apiResp struct {
+		Success bool `json:"success"`
+		Errors  []struct {
+			Message string `json:"message"`
+		} `json:"errors"`
+	}
+	if err := json.Unmarshal(body, &apiResp); err == nil {
+		if !apiResp.Success {
+			if len(apiResp.Errors) > 0 && apiResp.Errors[0].Message != "" {
+				return fmt.Errorf("Cloudflare 返回错误: %s", apiResp.Errors[0].Message)
+			}
+			return fmt.Errorf("Cloudflare 返回失败: %s", strings.TrimSpace(string(body)))
+		}
+	}
+
+	return nil
+}
+
+func blockCloudflareIP(apiToken, authEmail, zoneID, ip, note string) (string, error) {
+	ip = strings.TrimSpace(ip)
+	zoneID = strings.TrimSpace(zoneID)
+	if ip == "" {
+		return "", nil
+	}
+	if zoneID == "" {
+		return "", fmt.Errorf("Cloudflare Zone ID 为空")
+	}
+
+	payload, _ := json.Marshal(map[string]interface{}{
+		"mode": "block",
+		"configuration": map[string]string{
+			"target": "ip",
+			"value":  ip,
+		},
+		"notes": note,
+	})
+
+	endpoint := fmt.Sprintf("https://api.cloudflare.com/client/v4/zones/%s/firewall/access_rules/rules", zoneID)
+	req, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewBuffer(payload))
+	if err != nil {
+		return "", fmt.Errorf("构建 Cloudflare 拉黑请求失败: %w", err)
+	}
+	if authEmail != "" {
+		req.Header.Set("X-Auth-Email", authEmail)
+		req.Header.Set("X-Auth-Key", apiToken)
+	} else {
+		req.Header.Set("Authorization", "Bearer "+apiToken)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("Cloudflare 拉黑请求失败: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", fmt.Errorf("Cloudflare 拉黑返回状态 %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	var apiResp struct {
+		Success bool `json:"success"`
+		Result  struct {
+			ID string `json:"id"`
+		} `json:"result"`
+		Errors []struct {
+			Message string `json:"message"`
+		} `json:"errors"`
+	}
+	if err := json.Unmarshal(body, &apiResp); err == nil {
+		if !apiResp.Success {
+			if len(apiResp.Errors) > 0 && apiResp.Errors[0].Message != "" {
+				return "", fmt.Errorf("Cloudflare 拉黑返回错误: %s", apiResp.Errors[0].Message)
+			}
+			return "", fmt.Errorf("Cloudflare 拉黑返回失败: %s", strings.TrimSpace(string(body)))
+		}
+		if strings.TrimSpace(apiResp.Result.ID) == "" {
+			return "", fmt.Errorf("Cloudflare 拉黑返回规则 ID 为空")
+		}
+		return apiResp.Result.ID, nil
+	}
+
+	return "", fmt.Errorf("Cloudflare 拉黑返回解析失败")
+}
+
+func (l *commentAttemptLimiter) addAndCount(ip string, now int64) (int, int) {
+	windowCutoff := now - 60
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.request++
+
+	globalKept := l.all[:0]
+	for _, ts := range l.all {
+		if ts > windowCutoff {
+			globalKept = append(globalKept, ts)
+		}
+	}
+	l.all = append(globalKept, now)
+
+	ipEvents := l.byIP[ip]
+	ipKept := ipEvents[:0]
+	for _, ts := range ipEvents {
+		if ts > windowCutoff {
+			ipKept = append(ipKept, ts)
+		}
+	}
+	ipKept = append(ipKept, now)
+	l.byIP[ip] = ipKept
+	l.lastSeen[ip] = now
+
+	// Periodically prune expired IP keys to avoid unbounded map growth.
+	if l.request%64 == 0 {
+		keyCutoff := now - 600
+		for key, events := range l.byIP {
+			kept := events[:0]
+			for _, ts := range events {
+				if ts > windowCutoff {
+					kept = append(kept, ts)
+				}
+			}
+			if len(kept) == 0 && l.lastSeen[key] <= keyCutoff {
+				delete(l.byIP, key)
+				delete(l.lastSeen, key)
+			} else {
+				l.byIP[key] = kept
+			}
+		}
+	}
+
+	return len(ipKept), len(l.all)
+}
+
+func startStatsWorker(db *sql.DB) {
+	statsWG.Add(1)
+	defer statsWG.Done()
+	for logEntry := range statsChan {
+		_, err := db.Exec("INSERT INTO go_stats_logs (ip, ua, path, is_bot, created) VALUES (?, ?, ?, ?, ?)",
+			logEntry.IP, logEntry.UA, logEntry.Path, logEntry.IsBot, time.Now().Unix())
+		if err != nil {
+			log.Printf("Error writing stats log: %v", err)
+		}
+	}
+	log.Println("Statistics worker: all queued logs written to database.")
+}
+
+func startJanitor(db *sql.DB) {
+	for {
+		retentionDays := getOptionInt(db, "logRetentionDays", 30)
+		if retentionDays > 0 {
+			cutoff := time.Now().AddDate(0, 0, -retentionDays).Unix()
+			res, err := db.Exec("DELETE FROM go_stats_logs WHERE created < ?", cutoff)
+			if err != nil {
+				log.Printf("Janitor error: %v", err)
+			} else {
+				rows, _ := res.RowsAffected()
+				if rows > 0 {
+					log.Printf("Janitor: cleaned up %d old log records.", rows)
+				}
+			}
+
+			res, err = db.Exec("DELETE FROM go_cf_shield_logs WHERE created < ?", cutoff)
+			if err != nil {
+				log.Printf("Janitor shield log error: %v", err)
+			} else {
+				rows, _ := res.RowsAffected()
+				if rows > 0 {
+					log.Printf("Janitor: cleaned up %d old Cloudflare shield log records.", rows)
+				}
+			}
+		}
+		// 每小时检查一次
+		time.Sleep(1 * time.Hour)
+	}
+}
+
+type Post struct {
+	Cid         int
+	Title       string
+	Slug        string
+	Created     int64
+	Text        string
+	CommentsNum int
+	AuthorId    int
+	Author      string
+	Categories  []Category
+	IsTop       bool
+}
+
+type Category struct {
+	Mid  int
+	Name string
+	Slug string
+}
+
+type Comment struct {
+	Coid         int
+	Cid          int
+	Parent       int
+	Author       string
+	ParentAuthor string
+	Text         string
+	Created      int64
+	Replies      []*Comment
+}
+
+type DateArchiveItem struct {
+	Year  int
+	Month int
+	Count int
+	URL   string
+	Label string
+}
+
+type Tag struct {
+	Name string
+	Slug string
+}
+
+type SkinConfig struct {
+	Theme               string
+	ThemeBase           string
+	PrimaryColor        string
+	PrimaryHover        string
+	SuccessColor        string
+	TextPrimary         string
+	TextSecondary       string
+	TextMuted           string
+	BgPrimary           string
+	BgSecondary         string
+	BgAccent            string
+	BorderLight         string
+	HeaderBg            string
+	ThemeBtnHoverBg     string
+	ThemeBtnActiveBg    string
+	Radius              string
+	LayoutContainerMax  string
+	LayoutContainerPad  string
+	LayoutColumnGap     string
+	LayoutPagePadding   string
+	LayoutPostPadding   string
+	LayoutWidgetPadding string
+}
+
+type PostDetailData struct {
+	Site            SiteInfo
+	Post            Post
+	Tags            []Tag
+	Comments        []Comment
+	PrevPost        *Post
+	NextPost        *Post
+	RecentPosts     []Post
+	RecentComments  []Comment
+	Categories      []Category
+	CurrentSlug     string
+	CommentsEnabled bool
+}
+type SiteInfo struct {
+	Title       string
+	Description string
+	Keywords    string
+	Theme       string
+	ThemeBase   string
+	Skin        SkinConfig
+	SiteUrl     string
+	FooterCode  template.HTML
+}
+
+type sitemapURL struct {
+	Loc     string `xml:"loc"`
+	LastMod string `xml:"lastmod,omitempty"`
+}
+
+type sitemapURLSet struct {
+	XMLName xml.Name     `xml:"urlset"`
+	Xmlns   string       `xml:"xmlns,attr"`
+	URLs    []sitemapURL `xml:"url"`
+}
+
+type PageData struct {
+	Site            SiteInfo
+	Posts           []Post
+	RecentPosts     []Post
+	Categories      []Category
+	RecentComments  []Comment
+	ShowDateArchive bool
+	DateArchives    []DateArchiveItem
+	SearchQuery     string
+	ArchiveTitle    string
+	PaginationBase  string
+	CurrentSlug     string
+	CurrentPage     int
+	TotalPages      int
+	HasPrev         bool
+	HasNext         bool
+	PrevPage        int
+	NextPage        int
+}
+
+func statsMiddleware(db *sql.DB, adminPath string) gin.HandlerFunc {
+	// 定义需要排除的静态资源扩展名
+	assetExts := []string{".css", ".js", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".woff", ".woff2", ".ttf", ".map"}
+
+	return func(c *gin.Context) {
+		path := c.Request.URL.Path
+		pathLower := strings.ToLower(path)
+
+		// 基础排除逻辑
+		isAsset := false
+		for _, ext := range assetExts {
+			if strings.HasSuffix(pathLower, ext) {
+				isAsset = true
+				break
+			}
+		}
+
+		// 检查路径前缀排除
+		if c.Request.Method == "GET" &&
+			!isAsset &&
+			!strings.HasPrefix(path, adminPath) &&
+			!strings.HasPrefix(path, "/usr") &&
+			!strings.HasPrefix(path, "/blog/usr") &&
+			!strings.HasPrefix(path, "/static") &&
+			!strings.Contains(pathLower, "favicon") {
+
+			ua := c.Request.UserAgent()
+			uaLower := strings.ToLower(ua)
+
+			// 机器人/扫描器检测
+			isBot := 0
+			// 增加更广泛的自动化工具和搜索引擎特征
+			if strings.Contains(uaLower, "bot") ||
+				strings.Contains(uaLower, "spider") ||
+				strings.Contains(uaLower, "crawler") ||
+				strings.Contains(uaLower, "google") ||
+				strings.Contains(uaLower, "bing") ||
+				strings.Contains(uaLower, "baidu") ||
+				strings.Contains(uaLower, "sogou") ||
+				strings.Contains(uaLower, "360spider") ||
+				strings.Contains(uaLower, "haosouspider") ||
+				strings.Contains(uaLower, "yisouspider") ||
+				strings.Contains(uaLower, "yahoo") ||
+				strings.Contains(uaLower, "duckduckgo") ||
+				strings.Contains(uaLower, "yandex") ||
+				strings.Contains(uaLower, "applebot") ||
+				strings.Contains(uaLower, "curl") ||
+				strings.Contains(uaLower, "wget") ||
+				strings.Contains(uaLower, "scan") ||
+				strings.Contains(uaLower, "reader") ||
+				strings.Contains(uaLower, "rss") ||
+				strings.Contains(uaLower, "paloalto") ||
+				strings.Contains(uaLower, "headless") ||
+				strings.Contains(uaLower, "python") ||
+				strings.Contains(uaLower, "go-http-client") {
+				isBot = 1
+			}
+
+			// 优先从 Cloudflare 变量获取 IP
+			ip := clientIPFromRequest(c)
+
+			// 排除内网 IP 的统计（可选，如果你希望排除自己或内网网关的访问）
+			if strings.HasPrefix(ip, "172.") || strings.HasPrefix(ip, "192.168.") || strings.HasPrefix(ip, "127.0.0.") {
+				isBot = 1
+			}
+
+			// 算法变更：在中间件中，只记录确定是机器人的流量
+			// 真人流量由页面底部的 beacon 触发异步接口记录
+			if isBot == 1 {
+				select {
+				case statsChan <- statsLog{
+					IP:    ip,
+					UA:    ua,
+					Path:  path,
+					IsBot: 1,
+				}:
+				default:
+				}
+			}
+		}
+		c.Next()
+	}
+}
+
+type responseBodyWriter struct {
+	gin.ResponseWriter
+	body *bytes.Buffer
+}
+
+func (r responseBodyWriter) Write(b []byte) (int, error) {
+	return r.body.Write(b)
+}
+
+func beaconMiddleware(adminPath string) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		path := c.Request.URL.Path
+		// 只拦截 GET 请求，且排除后台路径和静态资源路径
+		if c.Request.Method != "GET" ||
+			strings.HasPrefix(path, adminPath) ||
+			strings.HasPrefix(path, "/usr") ||
+			strings.HasPrefix(path, "/static") {
+			c.Next()
+			return
+		}
+
+		w := &responseBodyWriter{body: &bytes.Buffer{}, ResponseWriter: c.Writer}
+		c.Writer = w
+		c.Next()
+
+		contentType := w.Header().Get("Content-Type")
+		if strings.Contains(contentType, "text/html") && w.Status() == http.StatusOK {
+			script := `<script>(function(){var _0x=['/a','pi','/sta','ts/b','eaco','n'];var _0y=_0x.join('');var b=new Image();b.src=_0y+'?path='+encodeURIComponent(window.location.pathname)+'&t='+(new Date()).getTime();})();</script>`
+			content := w.body.String()
+			lowerContent := strings.ToLower(content)
+			// 优先在 <head> 内注入；没有 <head> 就紧接 <html> 之后；两者都没有则插入 </body> 前
+			if idx := strings.Index(lowerContent, "<head"); idx != -1 {
+				if endIdx := strings.Index(content[idx:], ">"); endIdx != -1 {
+					insertPos := idx + endIdx + 1
+					content = content[:insertPos] + script + content[insertPos:]
+				} else {
+					content += script
+				}
+			} else if idx := strings.Index(lowerContent, "<html"); idx != -1 {
+				if endIdx := strings.Index(content[idx:], ">"); endIdx != -1 {
+					insertPos := idx + endIdx + 1
+					content = content[:insertPos] + script + content[insertPos:]
+				} else {
+					content += script
+				}
+			} else if idx := strings.LastIndex(lowerContent, "</body>"); idx != -1 {
+				content = content[:idx] + script + content[idx:]
+			} else {
+				content += script
+			}
+			// 必须设置新的 Content-Length，否则浏览器可能会截断
+			w.Header().Set("Content-Length", fmt.Sprint(len(content)))
+			w.ResponseWriter.Write([]byte(content))
+		} else {
+			w.ResponseWriter.Write(w.body.Bytes())
+		}
+	}
+}
+
+func handleBeacon(c *gin.Context) {
+	ua := c.Request.UserAgent()
+	uaLower := strings.ToLower(ua)
+
+	// 排除主流搜索引擎和机器人，因为它们也可能访问 beacon
+	if strings.Contains(uaLower, "bot") ||
+		strings.Contains(uaLower, "spider") ||
+		strings.Contains(uaLower, "crawler") ||
+		strings.Contains(uaLower, "google") ||
+		strings.Contains(uaLower, "bing") ||
+		strings.Contains(uaLower, "baidu") ||
+		strings.Contains(uaLower, "sogou") ||
+		strings.Contains(uaLower, "360spider") ||
+		strings.Contains(uaLower, "haosouspider") ||
+		strings.Contains(uaLower, "yisouspider") ||
+		strings.Contains(uaLower, "yahoo") ||
+		strings.Contains(uaLower, "duckduckgo") ||
+		strings.Contains(uaLower, "yandex") ||
+		strings.Contains(uaLower, "applebot") {
+		c.Status(http.StatusNoContent)
+		return
+	}
+
+	ip := clientIPFromRequest(c)
+
+	isBot := 0
+	if strings.HasPrefix(ip, "172.") || strings.HasPrefix(ip, "192.168.") || strings.HasPrefix(ip, "127.0.0.") {
+		isBot = 1
+	}
+
+	path := c.Query("path")
+	if path == "" {
+		path = "/"
+	}
+
+	select {
+	case statsChan <- statsLog{
+		IP:    ip,
+		UA:    ua,
+		Path:  path,
+		IsBot: isBot,
+	}:
+	default:
+	}
+
+	c.Status(http.StatusNoContent)
+}
+
+// fixAttachmentLinks 将 HTML 内容中的绝对路径附件/图片链接转换为相对路径
+// 这是一个为 Typecho 移植而设计的容错措施
+func fixAttachmentLinks(htmlContent string) string {
+	re := regexp.MustCompile(`(src|href)="https?://[^/]+(/[^"]+)"`)
+	return re.ReplaceAllStringFunc(htmlContent, func(match string) string {
+		sub := re.FindStringSubmatch(match)
+		if len(sub) < 3 {
+			return match
+		}
+		attr := sub[1]
+		path := sub[2]
+
+		// 转换逻辑：
+		// 1. 如果路径以 /usr/ 开头（Typecho 默认附件路径）
+		// 2. 如果文件是常见的图片格式，支持迁移后的各种路径
+
+		// 分离路径和查询参数以进行后缀检查
+		purePath := path
+		if idx := strings.Index(path, "?"); idx != -1 {
+			purePath = path[:idx]
+		}
+
+		lowerPath := strings.ToLower(purePath)
+		isImg := strings.HasSuffix(lowerPath, ".jpg") ||
+			strings.HasSuffix(lowerPath, ".jpeg") ||
+			strings.HasSuffix(lowerPath, ".png") ||
+			strings.HasSuffix(lowerPath, ".gif") ||
+			strings.HasSuffix(lowerPath, ".webp") ||
+			strings.HasSuffix(lowerPath, ".svg")
+
+		if strings.HasPrefix(path, "/usr/") || isImg {
+			return fmt.Sprintf("%s=\"%s\"", attr, path)
+		}
+
+		return match
+	})
+}
+
+func main() {
+	// Get executable path and change to its directory
+	exePath, err := os.Executable()
+	if err != nil {
+		log.Fatal(err)
+	}
+	exeDir := filepath.Dir(exePath)
+	if err := os.Chdir(exeDir); err != nil {
+		log.Fatal(err)
+	}
+
+	db, err := sql.Open("sqlite", "./blog.sqlite")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer db.Close()
+
+	// Initialize database schema
+	initDB(db)
+	applyConfiguredTimezone(db)
+
+	// 配置统计缓存队列大小
+	bufferSize := getOptionInt(db, "statsBufferSize", 100)
+	statsChan = make(chan statsLog, bufferSize)
+
+	// 启动后台统计处理协程
+	go startStatsWorker(db)
+	// 启动后台清理协程
+	go startJanitor(db)
+
+	// 优化 SQLite 性能
+	db.Exec("PRAGMA journal_mode=WAL")
+	db.Exec("PRAGMA synchronous=NORMAL")
+
+	r := gin.Default()
+	r.SetTrustedProxies(nil)
+
+	adminPath := getOption(db, "adminPath", "admin")
+	if !strings.HasPrefix(adminPath, "/") {
+		adminPath = "/" + adminPath
+	}
+	adminPath = strings.TrimSuffix(adminPath, "/")
+
+	cfShieldManager := newCloudflareShieldManager(db)
+	cfShieldStop := make(chan struct{})
+	go cfShieldManager.startAutoDisableWorker(cfShieldStop)
+
+	// 前台分钟级流量阈值检查，达到阈值时触发 Cloudflare 五秒盾。
+	r.Use(cfShieldManager.middleware(adminPath))
+	// 应用访问统计中间件
+	r.Use(statsMiddleware(db, adminPath))
+	// 应用 Beacon 动态注入中间件 (排除后台)
+	r.Use(beaconMiddleware(adminPath))
+
+	// 核心逻辑：动态后台路径的反向代理
+	// 前台服务 (8190) 监听所有流量，发现匹配 adminPath 时中转给后台 (8191)
+	handleProxy := func(c *gin.Context) {
+		target, _ := url.Parse("http://127.0.0.1:8191")
+		proxy := httputil.NewSingleHostReverseProxy(target)
+		proxy.ServeHTTP(c.Writer, c.Request)
+	}
+	r.Any(adminPath, handleProxy)
+	r.Any(adminPath+"/*any", handleProxy)
+
+	// Configure Markdown renderer
+	mdRenderer := goldmark.New(
+		goldmark.WithExtensions(extension.Linkify),
+		goldmark.WithRendererOptions(
+			html.WithHardWraps(),
+			html.WithUnsafe(),
+		),
+	)
+
+	// Serve static files from usr folder
+	r.Static("/usr", "./usr")
+	r.Static("/blog/usr", "./usr")
+
+	// Fallback to static folder for root-level files
+	r.NoRoute(func(c *gin.Context) {
+		path := c.Request.URL.Path
+
+		// 尝试从 static 目录直接查找 (例如 /favicon.ico)
+		fullPath := filepath.Join("./static", path)
+		if info, err := os.Stat(fullPath); err == nil && !info.IsDir() {
+			c.File(fullPath)
+			return
+		}
+
+		// 如果路径以 /blog/ 开头，且请求的是 .html 文件，尝试去除前缀后在 static 目录查找
+		if strings.HasPrefix(path, "/blog/") && strings.HasSuffix(path, ".html") {
+			relPath := strings.TrimPrefix(path, "/blog/")
+			fullPath = filepath.Join("./static", relPath)
+			if info, err := os.Stat(fullPath); err == nil && !info.IsDir() {
+				c.File(fullPath)
+				return
+			}
+		}
+
+		c.String(http.StatusNotFound, "404 page not found")
+	})
+
+	r.SetFuncMap(template.FuncMap{
+		"formatDate": func(t int64) string {
+			return time.Unix(t, 0).Format("2006-01-02")
+		},
+		"formatDateTime": func(t int64) string {
+			return time.Unix(t, 0).Format("2006-01-02T15:04:05Z07:00")
+		},
+		"now": func() time.Time {
+			return time.Now()
+		},
+		"substring": func(text string, maxLen int) string {
+			runes := []rune(text)
+			if len(runes) <= maxLen {
+				return text
+			}
+			return string(runes[:maxLen]) + "..."
+		},
+		"targetPage": func(base string, p int, search string) string {
+			if search != "" {
+				// Typecho search pagination: /blog/index.php/search/{keyword}/{page}/
+				if p == 1 {
+					return fmt.Sprintf("/blog/index.php/search/%s/", search)
+				}
+				return fmt.Sprintf("/blog/index.php/search/%s/%d/", search, p)
+			}
+
+			suffix := ""
+			if !strings.HasSuffix(base, "/") {
+				suffix = "/"
+			}
+
+			url := base
+			if p > 1 {
+				url = fmt.Sprintf("%s%spage/%d/", base, suffix, p)
+			}
+			return url
+		},
+		"paginationRange": func(current, total int) []interface{} {
+			var res []interface{}
+			if total <= 1 {
+				return res
+			}
+
+			delta := 1
+			res = append(res, 1)
+
+			start := current - delta
+			if start < 2 {
+				start = 2
+			}
+			end := current + delta
+			if end >= total {
+				end = total - 1
+			}
+
+			if start > 2 {
+				res = append(res, "...")
+			}
+
+			for i := start; i <= end; i++ {
+				res = append(res, i)
+			}
+
+			if end < total-1 {
+				res = append(res, "...")
+			}
+
+			res = append(res, total)
+
+			return res
+		},
+		"isStr": func(val interface{}) bool {
+			_, ok := val.(string)
+			return ok
+		},
+		"fullContent": func(p Post) template.HTML {
+			content := strings.TrimPrefix(p.Text, "<!--markdown-->")
+			parts := strings.Split(content, "<!--more-->")
+			excerpt := parts[0]
+
+			var buf bytes.Buffer
+			if err := mdRenderer.Convert([]byte(excerpt), &buf); err != nil {
+				return template.HTML(excerpt)
+			}
+
+			htmlContent := fixAttachmentLinks(buf.String())
+
+			// If <!--more--> was found, append the "Read more" link
+			if len(parts) > 1 {
+				moreLink := fmt.Sprintf("<p class=\"more\"><a href=\"/blog/index.php/archives/%d/\" title=\"%s\">- 阅读剩余部分 -</a></p>", p.Cid, p.Title)
+				htmlContent += moreLink
+			}
+
+			return template.HTML(htmlContent)
+		},
+		"renderMarkdown": func(text string) template.HTML {
+			content := strings.TrimPrefix(text, "<!--markdown-->")
+			var buf bytes.Buffer
+			if err := mdRenderer.Convert([]byte(content), &buf); err != nil {
+				return template.HTML(content)
+			}
+			return template.HTML(fixAttachmentLinks(buf.String()))
+		},
+		"permalink": func(p Post) string {
+			// Typecho default permalink: index.php/archives/{cid}/
+			return fmt.Sprintf("/blog/index.php/archives/%d/", p.Cid)
+		},
+		"catPermalink": func(c Category) string {
+			return fmt.Sprintf("/blog/index.php/category/%s/", c.Slug)
+		},
+		"commPermalink": func(c Comment) string {
+			return fmt.Sprintf("/blog/index.php/archives/%d/#comment-%d", c.Cid, c.Coid)
+		},
+		"contains":  strings.Contains,
+		"adminPath": func() string { return adminPath },
+	})
+
+	r.LoadHTMLGlob("templates/frontend/*")
+
+	handleIndex := func(c *gin.Context) {
+		s := c.Query("s")
+		if s == "" {
+			s = c.PostForm("s")
+		}
+
+		pageStr := c.Param("page")
+		if pageStr == "" {
+			pageStr = c.DefaultQuery("page", "1")
+		}
+		var page int
+		fmt.Sscanf(pageStr, "%d", &page)
+		if page < 1 {
+			page = 1
+		}
+		pageSize := getOptionInt(db, "pageSize", 10)
+
+		site := getSiteInfo(db)
+		posts, total := getPosts(db, page, pageSize, s)
+		recentPosts := getRecentPostsSidebar(db, "")
+		categories := getCategories(db)
+		recentComments := getRecentComments(db, "")
+		showDateArchive, dateArchiveLimit := getDateArchiveSettings(db)
+		var dateArchives []DateArchiveItem
+		if showDateArchive {
+			dateArchives = getDateArchives(db, dateArchiveLimit)
+		}
+
+		totalPages := (total + pageSize - 1) / pageSize
+
+		c.HTML(http.StatusOK, "index.html", PageData{
+			Site:            site,
+			Posts:           posts,
+			RecentPosts:     recentPosts,
+			Categories:      categories,
+			RecentComments:  recentComments,
+			ShowDateArchive: showDateArchive,
+			DateArchives:    dateArchives,
+			SearchQuery:     s,
+			PaginationBase:  "/blog/index.php/",
+			CurrentSlug:     "",
+			CurrentPage:     page,
+			TotalPages:      totalPages,
+			HasPrev:         page > 1,
+			HasNext:         page < totalPages,
+			PrevPage:        page - 1,
+			NextPage:        page + 1,
+		})
+	}
+
+	handleSearchRedirect := func(c *gin.Context) {
+		s := c.PostForm("s")
+		if s == "" {
+			s = c.Query("s")
+		}
+		if s != "" {
+			c.Redirect(http.StatusFound, fmt.Sprintf("/blog/index.php/search/%s/", s))
+			return
+		}
+		c.Redirect(http.StatusFound, "/blog/")
+	}
+
+	handleSearch := func(c *gin.Context) {
+		s := c.Param("keyword")
+		pageStr := c.Param("page")
+		if pageStr == "" {
+			pageStr = "1"
+		}
+		var page int
+		fmt.Sscanf(pageStr, "%d", &page)
+		if page < 1 {
+			page = 1
+		}
+		pageSize := getOptionInt(db, "pageSize", 10)
+
+		site := getSiteInfo(db)
+		posts, total := getPosts(db, page, pageSize, s)
+		recentPosts := getRecentPostsSidebar(db, "")
+		categories := getCategories(db)
+		recentComments := getRecentComments(db, "")
+		showDateArchive, dateArchiveLimit := getDateArchiveSettings(db)
+		var dateArchives []DateArchiveItem
+		if showDateArchive {
+			dateArchives = getDateArchives(db, dateArchiveLimit)
+		}
+
+		totalPages := (total + pageSize - 1) / pageSize
+
+		c.HTML(http.StatusOK, "index.html", PageData{
+			Site:            site,
+			Posts:           posts,
+			RecentPosts:     recentPosts,
+			Categories:      categories,
+			RecentComments:  recentComments,
+			ShowDateArchive: showDateArchive,
+			DateArchives:    dateArchives,
+			SearchQuery:     s,
+			PaginationBase:  fmt.Sprintf("/blog/index.php/search/%s/", s),
+			CurrentPage:     page,
+			TotalPages:      totalPages,
+			HasPrev:         page > 1,
+			HasNext:         page < totalPages,
+			PrevPage:        page - 1,
+			NextPage:        page + 1,
+		})
+	}
+
+	handlePost := func(c *gin.Context) {
+		cidStr := c.Param("cid")
+		var cid int
+		fmt.Sscanf(cidStr, "%d", &cid)
+
+		site := getSiteInfo(db)
+		post, ok := getPost(db, cid)
+		if !ok {
+			c.String(http.StatusNotFound, "Post not found")
+			return
+		}
+
+		// Check if any category of this post is offline
+		for _, cat := range post.Categories {
+			var isOffline int
+			db.QueryRow("SELECT is_offline FROM go_category_settings WHERE mid=?", cat.Mid).Scan(&isOffline)
+			if isOffline == 1 {
+				c.HTML(http.StatusNotFound, "error.html", gin.H{
+					"Site":         site,
+					"ErrorTitle":   "文章不可用",
+					"ErrorMessage": "抱歉，该文章所属分类已下线，暂时无法访问。",
+				})
+				return
+			}
+		}
+
+		tags := getPostTags(db, cid)
+		comments := getPostComments(db, cid)
+		prev, next := getPrevNextPosts(db, post.Created)
+		// Determine current category slug for navigation highlighting and sidebar context
+		currentSlug := ""
+		if len(post.Categories) > 0 {
+			currentSlug = post.Categories[0].Slug
+		}
+
+		recentPosts := getRecentPostsSidebar(db, currentSlug)
+		categories := getCategories(db)
+		recentComments := getRecentComments(db, currentSlug)
+
+		c.HTML(http.StatusOK, "post.html", PostDetailData{
+			Site:            site,
+			Post:            post,
+			Tags:            tags,
+			Comments:        comments,
+			PrevPost:        prev,
+			NextPost:        next,
+			RecentPosts:     recentPosts,
+			Categories:      categories,
+			RecentComments:  recentComments,
+			CurrentSlug:     currentSlug,
+			CommentsEnabled: getOption(db, "commentsEnabled", "1") == "1",
+		})
+	}
+
+	handleComment := func(c *gin.Context) {
+		cidStr := c.Param("cid")
+		var cid int
+		fmt.Sscanf(cidStr, "%d", &cid)
+
+		// 0. Global Comments Enabled Check
+		if getOption(db, "commentsEnabled", "1") != "1" {
+			site := getSiteInfo(db)
+			c.HTML(http.StatusForbidden, "error.html", gin.H{
+				"Site":         site,
+				"ErrorTitle":   "评论已关闭",
+				"ErrorMessage": "抱歉，本站已暂时关闭评论功能。您可以继续阅读文章。",
+			})
+			return
+		}
+
+		ip := c.ClientIP()
+		now := time.Now().Unix()
+		countIP, countGlobal := commentLimiter.addAndCount(ip, now)
+
+		// 1. IP Rate Limit Check
+		limitIP := getOptionInt(db, "commentLimitIP", 1)
+		if countIP > limitIP {
+			site := getSiteInfo(db)
+			c.HTML(http.StatusTooManyRequests, "error.html", gin.H{
+				"Site":         site,
+				"ErrorTitle":   "提交过于频繁",
+				"ErrorMessage": "抱歉，您提交评论的速度过快。请稍后再试。",
+			})
+			return
+		}
+
+		// 2. Global Rate Limit Check
+		limitGlobal := getOptionInt(db, "commentLimitGlobal", 2)
+		if countGlobal > limitGlobal {
+			site := getSiteInfo(db)
+			c.HTML(http.StatusTooManyRequests, "error.html", gin.H{
+				"Site":         site,
+				"ErrorTitle":   "系统繁忙",
+				"ErrorMessage": "目前全站评论提交过于密集，请稍候片刻再试。",
+			})
+			return
+		}
+
+		author := c.PostForm("author")
+		words := c.PostForm("words")
+		if author == "" || words == "" {
+			site := getSiteInfo(db)
+			c.HTML(http.StatusBadRequest, "error.html", gin.H{
+				"Site":         site,
+				"ErrorTitle":   "表单验证失败",
+				"ErrorMessage": "称呼和内容不能为空，请填写完整后再提交。",
+			})
+			return
+		}
+
+		// AI Spam Check
+		apiKey := getOption(db, "grokApiKey", "")
+		if getOption(db, "commentAiDetection", "0") == "1" && apiKey != "" {
+			apiUrl := getOption(db, "aiApiUrl", "https://api.groq.com/openai/v1/chat/completions")
+			model := getOption(db, "aiModel", "llama-3.3-70b-versatile")
+			threshold := getOptionInt(db, "aiThreshold", 5)
+			failClosed := getOption(db, "commentFailClosed", "0") == "1"
+			score, err := checkSpamAI(words, apiKey, apiUrl, model)
+			if err != nil && failClosed {
+				site := getSiteInfo(db)
+				c.HTML(http.StatusServiceUnavailable, "error.html", gin.H{
+					"Site":         site,
+					"ErrorTitle":   "评论发布失败",
+					"ErrorMessage": "评论发布失败，请稍后再试。",
+				})
+				return
+			}
+			if score > threshold {
+				site := getSiteInfo(db)
+				c.HTML(http.StatusForbidden, "error.html", gin.H{
+					"Site":         site,
+					"ErrorTitle":   "评论被拒绝",
+					"ErrorMessage": "抱歉，系统检测到您的评论可能包含不当内容。如果这是误判，请修改后重新提交。",
+				})
+				return
+			}
+		}
+
+		// Get post author for ownerId
+		var ownerId int
+		err := db.QueryRow("SELECT authorId FROM typecho_contents WHERE cid=?", cid).Scan(&ownerId)
+		if err != nil {
+			site := getSiteInfo(db)
+			c.HTML(http.StatusInternalServerError, "error.html", gin.H{
+				"Site":         site,
+				"ErrorTitle":   "数据库错误",
+				"ErrorMessage": "系统无法获取文章信息，请稍后重试。",
+			})
+			return
+		}
+
+		agent := c.Request.UserAgent()
+
+		// Handle comment audit setting
+		auditEnabled := getOption(db, "commentAudit", "0") == "1"
+		initialStatus := "approved"
+		if auditEnabled {
+			initialStatus = "waiting"
+		}
+
+		_, err = db.Exec(`
+			INSERT INTO typecho_comments (cid, created, author, authorId, ownerId, ip, agent, text, type, status, parent)
+			VALUES (?, ?, ?, 0, ?, ?, ?, ?, 'comment', ?, 0)`,
+			cid, now, author, ownerId, ip, agent, words, initialStatus)
+
+		if err != nil {
+			site := getSiteInfo(db)
+			c.HTML(http.StatusInternalServerError, "error.html", gin.H{
+				"Site":         site,
+				"ErrorTitle":   "保存失败",
+				"ErrorMessage": "评论保存时出现错误，请稍后重试。",
+			})
+			return
+		}
+
+		// Update commentsNum (only if approved)
+		if initialStatus == "approved" {
+			db.Exec("UPDATE typecho_contents SET commentsNum = commentsNum + 1 WHERE cid = ?", cid)
+		}
+
+		// If it needs audit, show a message instead of redirecting
+		if initialStatus == "waiting" {
+			site := getSiteInfo(db)
+			c.HTML(http.StatusOK, "error.html", gin.H{
+				"Site":         site,
+				"ErrorTitle":   "评论已提交",
+				"ErrorMessage": "您的评论已成功提交，正在等待管理员审核。审核通过后将正式显示。",
+			})
+			return
+		}
+
+		c.Redirect(http.StatusFound, fmt.Sprintf("/blog/index.php/archives/%d/", cid))
+	}
+
+	handleCategory := func(c *gin.Context) {
+		slug := c.Param("slug")
+		pageStr := c.Param("page")
+		if pageStr == "" {
+			pageStr = "1"
+		}
+		var page int
+		fmt.Sscanf(pageStr, "%d", &page)
+		if page < 1 {
+			page = 1
+		}
+		pageSize := getOptionInt(db, "pageSize", 10)
+
+		site := getSiteInfo(db)
+
+		// Find category name by slug and check offline status
+		var catName string
+		var isOffline int
+		db.QueryRow(`SELECT m.name, COALESCE(s.is_offline, 0) 
+                     FROM typecho_metas m 
+                     LEFT JOIN go_category_settings s ON m.mid = s.mid 
+                     WHERE m.slug=? AND m.type='category'`, slug).Scan(&catName, &isOffline)
+
+		if catName == "" || isOffline == 1 {
+			c.HTML(http.StatusNotFound, "error.html", gin.H{
+				"Site":         site,
+				"ErrorTitle":   "分类不存在",
+				"ErrorMessage": "抱歉，您访问的分类不存在或已被下线。",
+			})
+			return
+		}
+
+		posts, total := getPostsByCategory(db, page, pageSize, slug)
+		recentPosts := getRecentPostsSidebar(db, slug)
+		categories := getCategories(db)
+		recentComments := getRecentComments(db, slug)
+		showDateArchive, dateArchiveLimit := getDateArchiveSettings(db)
+		var dateArchives []DateArchiveItem
+		if showDateArchive {
+			dateArchives = getDateArchives(db, dateArchiveLimit)
+		}
+
+		totalPages := (total + pageSize - 1) / pageSize
+
+		c.HTML(http.StatusOK, "index.html", PageData{
+			Site:            site,
+			Posts:           posts,
+			RecentPosts:     recentPosts,
+			Categories:      categories,
+			RecentComments:  recentComments,
+			ShowDateArchive: showDateArchive,
+			DateArchives:    dateArchives,
+			ArchiveTitle:    fmt.Sprintf("分类 %s 下的文章", catName),
+			PaginationBase:  fmt.Sprintf("/blog/index.php/category/%s/", slug),
+			CurrentSlug:     slug,
+			CurrentPage:     page,
+			TotalPages:      totalPages,
+			HasPrev:         page > 1,
+			HasNext:         page < totalPages,
+			PrevPage:        page - 1,
+			NextPage:        page + 1,
+		})
+	}
+
+	handleDateArchive := func(c *gin.Context) {
+		yearStr := c.Param("year")
+		monthStr := c.Param("month")
+		pageStr := c.Param("page")
+		if pageStr == "" {
+			pageStr = "1"
+		}
+
+		year, errYear := strconv.Atoi(yearStr)
+		month, errMonth := strconv.Atoi(monthStr)
+		page, errPage := strconv.Atoi(pageStr)
+		if errYear != nil || errMonth != nil || errPage != nil || year < 1970 || month < 1 || month > 12 || page < 1 {
+			site := getSiteInfo(db)
+			c.HTML(http.StatusNotFound, "error.html", gin.H{
+				"Site":         site,
+				"ErrorTitle":   "归档不存在",
+				"ErrorMessage": "抱歉，您访问的归档不存在。",
+			})
+			return
+		}
+
+		pageSize := getOptionInt(db, "pageSize", 10)
+		site := getSiteInfo(db)
+		posts, total := getPostsByYearMonth(db, page, pageSize, year, month)
+		recentPosts := getRecentPostsSidebar(db, "")
+		categories := getCategories(db)
+		recentComments := getRecentComments(db, "")
+		showDateArchive, dateArchiveLimit := getDateArchiveSettings(db)
+		var dateArchives []DateArchiveItem
+		if showDateArchive {
+			dateArchives = getDateArchives(db, dateArchiveLimit)
+		}
+		totalPages := (total + pageSize - 1) / pageSize
+
+		c.HTML(http.StatusOK, "index.html", PageData{
+			Site:            site,
+			Posts:           posts,
+			RecentPosts:     recentPosts,
+			Categories:      categories,
+			RecentComments:  recentComments,
+			ShowDateArchive: showDateArchive,
+			DateArchives:    dateArchives,
+			ArchiveTitle:    fmt.Sprintf("%04d年%02d月归档", year, month),
+			PaginationBase:  fmt.Sprintf("/blog/index.php/%04d/%02d/", year, month),
+			CurrentPage:     page,
+			TotalPages:      totalPages,
+			HasPrev:         page > 1,
+			HasNext:         page < totalPages,
+			PrevPage:        page - 1,
+			NextPage:        page + 1,
+		})
+	}
+
+	handleSitemap := func(c *gin.Context) {
+		entries := buildSitemapEntries(db, c.Request)
+		c.Header("Content-Type", "application/xml; charset=utf-8")
+		c.String(http.StatusOK, xml.Header)
+		encoder := xml.NewEncoder(c.Writer)
+		encoder.Indent("", "  ")
+		if err := encoder.Encode(sitemapURLSet{
+			Xmlns: "http://www.sitemaps.org/schemas/sitemap/0.9",
+			URLs:  entries,
+		}); err != nil {
+			log.Printf("Error rendering sitemap: %v", err)
+		}
+	}
+
+	r.GET("/sitemap.xml", handleSitemap)
+	r.GET("/blog", handleIndex)
+	r.GET("/blog/", handleIndex)
+	r.GET("/blog/index.php", handleIndex)
+	r.GET("/blog/index.php/", handleIndex)
+	r.POST("/blog", handleSearchRedirect)
+	r.POST("/blog/", handleSearchRedirect)
+	r.POST("/blog/index.php", handleSearchRedirect)
+	r.POST("/blog/index.php/", handleSearchRedirect)
+	r.GET("/blog/index.php/page/:page", handleIndex)
+	r.GET("/blog/index.php/search/:keyword", handleSearch)
+	r.GET("/blog/index.php/search/:keyword/", handleSearch)
+	r.GET("/blog/index.php/search/:keyword/:page", handleSearch)
+	r.GET("/blog/index.php/search/:keyword/:page/", handleSearch)
+	r.GET("/blog/index.php/category/:slug", handleCategory)
+	r.GET("/blog/index.php/category/:slug/", handleCategory)
+	r.GET("/blog/index.php/category/:slug/:page", handleCategory)
+	r.GET("/blog/index.php/category/:slug/:page/", handleCategory)
+	r.GET("/blog/index.php/category/:slug/page/:page", handleCategory)
+	r.GET("/blog/index.php/category/:slug/page/:page/", handleCategory)
+	r.GET("/blog/index.php/:year/:month", handleDateArchive)
+	r.GET("/blog/index.php/:year/:month/", handleDateArchive)
+	r.GET("/blog/index.php/:year/:month/page/:page", handleDateArchive)
+	r.GET("/blog/index.php/:year/:month/page/:page/", handleDateArchive)
+	r.GET("/blog/index.php/archives/:cid", handlePost)
+	r.GET("/blog/index.php/archives/:cid/", handlePost)
+	r.POST("/blog/index.php/archives/:cid/comment", handleComment)
+	r.GET("/blog/archives/:cid", handlePost)
+	r.GET("/blog/archives/:cid/", handlePost)
+	r.GET("/api/stats/beacon", handleBeacon)
+
+	srv := &http.Server{
+		Addr:    "0.0.0.0:8190",
+		Handler: r,
+	}
+
+	fmt.Println("Server starting on :8190")
+	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		log.Fatalf("listen: %s\n", err)
+	}
+	close(cfShieldStop)
+	log.Println("Waiting for statistics worker to finish...")
+	close(statsChan)
+	statsWG.Wait()
+
+	log.Println("Server exiting")
+}
+
+func applyConfiguredTimezone(db *sql.DB) {
+	tz := strings.TrimSpace(getOption(db, "timezone", "Asia/Shanghai"))
+	if tz == "" {
+		tz = "Asia/Shanghai"
+	}
+	if tz == "system" {
+		time.Local = systemTimeLocation
+		return
+	}
+	loc, ok := loadTimezoneLocation(tz)
+	if !ok {
+		log.Printf("Invalid timezone %q, fallback to Asia/Shanghai", tz)
+		loc = time.FixedZone("GMT+8", 8*60*60)
+	}
+	time.Local = loc
+}
+
+func loadTimezoneLocation(tz string) (*time.Location, bool) {
+	loc, err := time.LoadLocation(tz)
+	if err == nil {
+		return loc, true
+	}
+	seconds, convErr := strconv.Atoi(tz)
+	if convErr != nil {
+		return nil, false
+	}
+	return time.FixedZone(formatGMTOffset(seconds), seconds), true
+}
+
+func formatGMTOffset(offsetSeconds int) string {
+	sign := "+"
+	if offsetSeconds < 0 {
+		sign = "-"
+		offsetSeconds = -offsetSeconds
+	}
+	hours := offsetSeconds / 3600
+	minutes := (offsetSeconds % 3600) / 60
+	return fmt.Sprintf("GMT%s%02d:%02d", sign, hours, minutes)
+}
+
+func initDB(db *sql.DB) {
+	schema := []string{
+		`CREATE TABLE IF NOT EXISTS "typecho_comments" (
+			"coid" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+			"cid" INTEGER DEFAULT 0,
+			"created" INTEGER DEFAULT 0,
+			"author" VARCHAR(150),
+			"authorId" INTEGER DEFAULT 0,
+			"ownerId" INTEGER DEFAULT 0,
+			"mail" VARCHAR(150),
+			"url" VARCHAR(255),
+			"ip" VARCHAR(64),
+			"agent" VARCHAR(511),
+			"text" TEXT,
+			"type" VARCHAR(16) DEFAULT 'comment',
+			"status" VARCHAR(16) DEFAULT 'approved',
+			"parent" INTEGER DEFAULT 0
+		)`,
+		`CREATE TABLE IF NOT EXISTS "typecho_contents" (
+			"cid" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+			"title" VARCHAR(150),
+			"slug" VARCHAR(150) UNIQUE,
+			"created" INTEGER DEFAULT 0,
+			"modified" INTEGER DEFAULT 0,
+			"text" LONGTEXT,
+			"order" INTEGER DEFAULT 0,
+			"authorId" INTEGER DEFAULT 0,
+			"template" VARCHAR(32),
+			"type" VARCHAR(16) DEFAULT 'post',
+			"status" VARCHAR(16) DEFAULT 'publish',
+			"password" VARCHAR(32),
+			"commentsNum" INTEGER DEFAULT 0,
+			"allowComment" CHAR(1) DEFAULT '0',
+			"allowPing" CHAR(1) DEFAULT '0',
+			"allowFeed" CHAR(1) DEFAULT '0',
+			"parent" INTEGER DEFAULT 0
+		)`,
+		`CREATE TABLE IF NOT EXISTS "typecho_metas" (
+			"mid" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+			"name" VARCHAR(150),
+			"slug" VARCHAR(150),
+			"type" VARCHAR(32) NOT NULL,
+			"description" VARCHAR(150),
+			"count" INTEGER DEFAULT 0,
+			"order" INTEGER DEFAULT 0,
+			"parent" INTEGER DEFAULT 0
+		)`,
+		`CREATE TABLE IF NOT EXISTS "typecho_options" (
+			"name" VARCHAR(32) NOT NULL,
+			"user" INTEGER NOT NULL DEFAULT 0,
+			"value" TEXT,
+			PRIMARY KEY ("name", "user")
+		)`,
+		`CREATE TABLE IF NOT EXISTS "typecho_relationships" (
+			"cid" INTEGER NOT NULL,
+			"mid" INTEGER NOT NULL,
+			PRIMARY KEY ("cid", "mid")
+		)`,
+		`CREATE TABLE IF NOT EXISTS "typecho_users" (
+			"uid" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+			"name" VARCHAR(32) UNIQUE,
+			"password" VARCHAR(64),
+			"mail" VARCHAR(150) UNIQUE,
+			"url" VARCHAR(150),
+			"screenName" VARCHAR(32),
+			"created" INTEGER DEFAULT 0,
+			"activated" INTEGER DEFAULT 0,
+			"logged" INTEGER DEFAULT 0,
+			"group" VARCHAR(16) DEFAULT 'visitor',
+			"authCode" VARCHAR(64)
+		)`,
+		`CREATE TABLE IF NOT EXISTS "go_sessions" (
+			"session_id" TEXT PRIMARY KEY,
+			"username" TEXT,
+			"created_at" INTEGER
+		)`,
+		`CREATE TABLE IF NOT EXISTS "go_options" (
+			"name" TEXT PRIMARY KEY,
+			"value" TEXT
+		)`,
+		`CREATE TABLE IF NOT EXISTS "go_category_settings" (
+			"mid" INTEGER PRIMARY KEY,
+			"show_on_home" INTEGER DEFAULT 1,
+			"is_offline" INTEGER DEFAULT 0
+		)`,
+		`CREATE TABLE IF NOT EXISTS "go_stats_logs" (
+			"id" INTEGER PRIMARY KEY AUTOINCREMENT,
+			"ip" VARCHAR(64),
+			"ua" VARCHAR(511),
+			"path" VARCHAR(255),
+			"is_bot" INTEGER DEFAULT 0,
+			"created" INTEGER
+		)`,
+		`CREATE TABLE IF NOT EXISTS "go_cf_shield_logs" (
+			"id" INTEGER PRIMARY KEY AUTOINCREMENT,
+			"ip" VARCHAR(64),
+			"path" VARCHAR(255),
+			"ua" VARCHAR(511),
+			"blocked_ips" TEXT,
+			"created" INTEGER
+		)`,
+		`CREATE INDEX IF NOT EXISTS "idx_stats_created" ON "go_stats_logs" ("created")`,
+		`CREATE INDEX IF NOT EXISTS "idx_stats_bot" ON "go_stats_logs" ("is_bot")`,
+		`CREATE INDEX IF NOT EXISTS "idx_cf_shield_logs_created" ON "go_cf_shield_logs" ("created")`,
+	}
+
+	for _, s := range schema {
+		_, err := db.Exec(s)
+		if err != nil {
+			log.Printf("Error creating table: %v", err)
+		}
+	}
+	_, err := db.Exec(`ALTER TABLE go_cf_shield_logs ADD COLUMN blocked_ips TEXT`)
+	if err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
+		log.Printf("Error updating Cloudflare shield logs table: %v", err)
+	}
+
+	// Bootstrap a default category if none exists
+	var catCount int
+	db.QueryRow("SELECT COUNT(*) FROM typecho_metas WHERE type='category'").Scan(&catCount)
+	if catCount == 0 {
+		res, err := db.Exec("INSERT INTO typecho_metas (name, slug, type, description) VALUES (?, ?, ?, ?)", "默认分类", "default", "category", "由系统自动创建的默认分类")
+		if err == nil {
+			lastId, _ := res.LastInsertId()
+			// Set as default in go_options if not exists
+			db.Exec("INSERT INTO go_options (name, value) VALUES ('defaultCategory', ?) ON CONFLICT(name) DO NOTHING", fmt.Sprintf("%d", lastId))
+		}
+	}
+
+	// Initialize default options if empty
+	var count int
+	db.QueryRow("SELECT COUNT(*) FROM typecho_options").Scan(&count)
+	if count == 0 {
+		options := map[string]string{
+			"title":       "我的 Go 博客",
+			"description": "基于 Go 语言的极速博客系统",
+			"theme":       "default",
+			"siteUrl":     "http://localhost:8190",
+			"timezone":    "Asia/Shanghai",
+		}
+		for k, v := range options {
+			db.Exec("INSERT INTO typecho_options (name, user, value) VALUES (?, 0, ?)", k, v)
+		}
+		log.Println("Database initialized with default options.")
+	}
+
+	// User initialization is now handled by the installer or build script
+}
+
+func getSiteInfo(db *sql.DB) SiteInfo {
+	skin := getSkinConfig(db)
+	return SiteInfo{
+		Title:       getOption(db, "title", "我的 Go 博客"),
+		Description: getOption(db, "description", "基于 Go 语言的极速博客系统"),
+		Keywords:    getOption(db, "keywords", ""),
+		Theme:       skin.Theme,
+		ThemeBase:   skin.ThemeBase,
+		Skin:        skin,
+		SiteUrl:     getOption(db, "siteUrl", "http://localhost:8190"),
+		FooterCode:  template.HTML(getOption(db, "footerCode", "")),
+	}
+}
+
+func getSkinConfig(db *sql.DB) SkinConfig {
+	theme := sanitizeThemeName(getOption(db, "theme", "default"), "default")
+	return SkinConfig{
+		Theme:               theme,
+		ThemeBase:           "/blog/usr/themes/" + theme,
+		PrimaryColor:        sanitizeSkinColor(getOption(db, "primaryColor", "#3b82f6"), "#3b82f6"),
+		PrimaryHover:        sanitizeSkinColor(getOption(db, "primaryHover", "#2563eb"), "#2563eb"),
+		SuccessColor:        sanitizeSkinColor(getOption(db, "successColor", "#10b981"), "#10b981"),
+		TextPrimary:         sanitizeSkinColor(getOption(db, "textPrimary", "#1f2937"), "#1f2937"),
+		TextSecondary:       sanitizeSkinColor(getOption(db, "textSecondary", "#6b7280"), "#6b7280"),
+		TextMuted:           sanitizeSkinColor(getOption(db, "textMuted", "#9ca3af"), "#9ca3af"),
+		BgPrimary:           sanitizeSkinColor(getOption(db, "bgPrimary", "#f3f4f6"), "#f3f4f6"),
+		BgSecondary:         sanitizeSkinColor(getOption(db, "bgSecondary", "#e5e7eb"), "#e5e7eb"),
+		BgAccent:            sanitizeSkinColor(getOption(db, "bgAccent", "#d1d5db"), "#d1d5db"),
+		BorderLight:         sanitizeSkinColor(getOption(db, "borderLight", "#c5c9d1"), "#c5c9d1"),
+		HeaderBg:            sanitizeSkinColor(getOption(db, "headerBg", "rgba(243, 244, 246, 0.8)"), "rgba(243, 244, 246, 0.8)"),
+		ThemeBtnHoverBg:     sanitizeSkinColor(getOption(db, "themeBtnHoverBg", "rgba(31, 41, 55, 0.06)"), "rgba(31, 41, 55, 0.06)"),
+		ThemeBtnActiveBg:    sanitizeSkinColor(getOption(db, "themeBtnActiveBg", "rgba(59, 130, 246, 0.14)"), "rgba(59, 130, 246, 0.14)"),
+		Radius:              sanitizeSkinLength(getOption(db, "radius", "8px"), "8px"),
+		LayoutContainerMax:  sanitizeSkinLength(getOption(db, "layoutContainerMax", "1000px"), "1000px"),
+		LayoutContainerPad:  sanitizeSkinLength(getOption(db, "layoutContainerPad", "15px"), "15px"),
+		LayoutColumnGap:     sanitizeSkinLength(getOption(db, "layoutColumnGap", "10px"), "10px"),
+		LayoutPagePadding:   sanitizeSkinLength(getOption(db, "layoutPagePadding", "15px"), "15px"),
+		LayoutPostPadding:   sanitizeSkinLength(getOption(db, "layoutPostPadding", "32px"), "32px"),
+		LayoutWidgetPadding: sanitizeSkinLength(getOption(db, "layoutWidgetPadding", "16px"), "16px"),
+	}
+}
+
+func sanitizeThemeName(value, fallback string) string {
+	value = strings.TrimSpace(value)
+	if value == "" || !skinThemeNamePattern.MatchString(value) {
+		return fallback
+	}
+	return value
+}
+
+func sanitizeSkinColor(value, fallback string) string {
+	value = strings.TrimSpace(value)
+	if value == "" || !skinColorPattern.MatchString(value) {
+		return fallback
+	}
+	return value
+}
+
+func sanitizeSkinLength(value, fallback string) string {
+	value = strings.TrimSpace(value)
+	match := skinLengthPattern.FindStringSubmatch(value)
+	if match == nil {
+		return fallback
+	}
+	if match[1] == "0" || match[2] != "" {
+		return strings.ToLower(value)
+	}
+	return match[1] + "px"
+}
+
+func buildSitemapEntries(db *sql.DB, req *http.Request) []sitemapURL {
+	baseURL := getSitemapBaseURL(db, req)
+	entries := []sitemapURL{
+		buildSitemapURL(baseURL, "/blog/index.php", time.Now().Unix()),
+	}
+
+	rows, err := db.Query(`
+		SELECT cid, created, modified
+		FROM typecho_contents
+		WHERE type='post' AND status='publish'
+		AND cid NOT IN (
+			SELECT cid FROM typecho_relationships r
+			JOIN go_category_settings s ON r.mid = s.mid
+			WHERE s.show_on_home = 0 OR s.is_offline = 1
+		)
+		ORDER BY created DESC`)
+	if err == nil {
+		defer rows.Close()
+		for rows.Next() {
+			var cid int
+			var created int64
+			var modified int64
+			if scanErr := rows.Scan(&cid, &created, &modified); scanErr != nil {
+				continue
+			}
+			lastMod := modified
+			if lastMod <= 0 {
+				lastMod = created
+			}
+			entries = append(entries, buildSitemapURL(baseURL, fmt.Sprintf("/blog/index.php/archives/%d/", cid), lastMod))
+		}
+	}
+
+	catRows, err := db.Query(`
+		SELECT m.slug
+		FROM typecho_metas m
+		LEFT JOIN go_category_settings s ON m.mid = s.mid
+		WHERE m.type='category' AND COALESCE(s.is_offline, 0) = 0
+		ORDER BY m."order" ASC, m.mid ASC`)
+	if err == nil {
+		defer catRows.Close()
+		for catRows.Next() {
+			var slug string
+			if scanErr := catRows.Scan(&slug); scanErr != nil || slug == "" {
+				continue
+			}
+			entries = append(entries, buildSitemapURL(baseURL, "/blog/index.php/category/"+slug+"/", 0))
+		}
+	}
+
+	archiveRows, err := db.Query(`
+		SELECT 
+			CAST(strftime('%Y', datetime(created, 'unixepoch', 'localtime')) AS INTEGER) AS y,
+			CAST(strftime('%m', datetime(created, 'unixepoch', 'localtime')) AS INTEGER) AS m,
+			MAX(CASE WHEN modified > 0 THEN modified ELSE created END)
+		FROM typecho_contents
+		WHERE type='post' AND status='publish'
+		AND cid NOT IN (
+			SELECT cid FROM typecho_relationships r
+			JOIN go_category_settings s ON r.mid = s.mid
+			WHERE s.show_on_home = 0 OR s.is_offline = 1
+		)
+		GROUP BY y, m
+		ORDER BY y DESC, m DESC`)
+	if err == nil {
+		defer archiveRows.Close()
+		for archiveRows.Next() {
+			var year int
+			var month int
+			var lastMod int64
+			if scanErr := archiveRows.Scan(&year, &month, &lastMod); scanErr != nil {
+				continue
+			}
+			entries = append(entries, buildSitemapURL(baseURL, fmt.Sprintf("/blog/index.php/%04d/%02d/", year, month), lastMod))
+		}
+	}
+
+	return entries
+}
+
+func getSitemapBaseURL(db *sql.DB, req *http.Request) string {
+	configured := strings.TrimSpace(getOption(db, "siteUrl", ""))
+	if configured != "" {
+		return normalizeSiteURL(configured)
+	}
+	return getRequestBaseURL(req)
+}
+
+func buildSitemapURL(baseURL, path string, unixTs int64) sitemapURL {
+	entry := sitemapURL{
+		Loc: strings.TrimRight(baseURL, "/") + path,
+	}
+	if unixTs > 0 {
+		entry.LastMod = time.Unix(unixTs, 0).UTC().Format("2006-01-02T15:04:05Z")
+	}
+	return entry
+}
+
+func normalizeSiteURL(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return "http://localhost:8190"
+	}
+	trimmed = strings.TrimRight(trimmed, "/")
+	if strings.HasPrefix(trimmed, "http://") || strings.HasPrefix(trimmed, "https://") {
+		return trimmed
+	}
+	return "http://" + trimmed
+}
+
+func getRequestBaseURL(req *http.Request) string {
+	host := strings.TrimSpace(req.Host)
+	if host == "" {
+		return "http://localhost:8190"
+	}
+
+	proto := strings.TrimSpace(req.Header.Get("X-Forwarded-Proto"))
+	if proto == "" {
+		if req.TLS != nil {
+			proto = "https"
+		} else {
+			proto = "http"
+		}
+	} else {
+		commaIdx := strings.Index(proto, ",")
+		if commaIdx >= 0 {
+			proto = strings.TrimSpace(proto[:commaIdx])
+		}
+	}
+
+	return proto + "://" + host
+}
+
+func getOption(db *sql.DB, name string, defaultValue string) string {
+	var val string
+	err := db.QueryRow("SELECT value FROM go_options WHERE name=?", name).Scan(&val)
+	if err == nil {
+		return val
+	}
+	// Fallback to typecho_options
+	err = db.QueryRow("SELECT value FROM typecho_options WHERE name=? AND user=0", name).Scan(&val)
+	if err == nil {
+		return val
+	}
+	return defaultValue
+}
+
+func getOptionInt(db *sql.DB, name string, defaultValue int) int {
+	val := getOption(db, name, "")
+	if val == "" {
+		return defaultValue
+	}
+	var i int
+	fmt.Sscanf(val, "%d", &i)
+	if i == 0 {
+		return defaultValue
+	}
+	return i
+}
+
+func getDateArchiveSettings(db *sql.DB) (bool, int) {
+	show := getOption(db, "showDateArchives", "1") == "1"
+	limit := getOptionInt(db, "dateArchivesSize", 12)
+	if limit < 1 {
+		limit = 12
+	}
+	if limit > 120 {
+		limit = 120
+	}
+	return show, limit
+}
+
+func getOptionInt64(db *sql.DB, name string, defaultValue int64) int64 {
+	val := strings.TrimSpace(getOption(db, name, ""))
+	if val == "" {
+		return defaultValue
+	}
+	i, err := strconv.ParseInt(val, 10, 64)
+	if err != nil {
+		return defaultValue
+	}
+	return i
+}
+
+func setOption(db *sql.DB, name string, value string) {
+	_, err := db.Exec("INSERT INTO go_options (name, value) VALUES (?, ?) ON CONFLICT(name) DO UPDATE SET value=excluded.value", name, value)
+	if err != nil {
+		log.Printf("Error setting option %s: %v", name, err)
+	}
+}
+
+func getPost(db *sql.DB, cid int) (Post, bool) {
+	var p Post
+	query := `SELECT t.cid, t.title, t.slug, t.created, t.text, t.commentsNum, t.authorId, u.screenName 
+              FROM typecho_contents t 
+              LEFT JOIN typecho_users u ON t.authorId = u.uid 
+              WHERE t.cid=? AND t.status='publish' AND t.type='post'`
+	err := db.QueryRow(query, cid).Scan(&p.Cid, &p.Title, &p.Slug, &p.Created, &p.Text, &p.CommentsNum, &p.AuthorId, &p.Author)
+	if err != nil {
+		return p, false
+	}
+	if p.Author == "" {
+		p.Author = "admin"
+	}
+	p.Categories = getPostCategories(db, p.Cid)
+	stickyCidsStr := getOption(db, "sticky_cids", "")
+	for _, idStr := range strings.Split(stickyCidsStr, ",") {
+		if idStr != "" && idStr == fmt.Sprintf("%d", p.Cid) {
+			p.IsTop = true
+			break
+		}
+	}
+	return p, true
+}
+
+func getPosts(db *sql.DB, page, pageSize int, search string) ([]Post, int) {
+	var total int
+	queryCount := `SELECT COUNT(*) FROM typecho_contents t 
+                   WHERE t.type='post' AND t.status='publish' 
+                   AND t.cid NOT IN (SELECT cid FROM typecho_relationships r JOIN go_category_settings s ON r.mid = s.mid WHERE s.show_on_home = 0 OR s.is_offline = 1)`
+	queryList := `SELECT t.cid, t.title, t.slug, t.created, t.text, t.commentsNum, t.authorId, u.screenName 
+                  FROM typecho_contents t 
+                  LEFT JOIN typecho_users u ON t.authorId = u.uid 
+                  WHERE t.type='post' AND t.status='publish'
+                  AND t.cid NOT IN (SELECT cid FROM typecho_relationships r JOIN go_category_settings s ON r.mid = s.mid WHERE s.show_on_home = 0 OR s.is_offline = 1)`
+	var args []interface{}
+
+	if search != "" {
+		filter := " AND (t.title LIKE ? OR t.text LIKE ?)"
+		queryCount += filter
+		queryList += filter
+		args = append(args, "%"+search+"%", "%"+search+"%")
+	}
+
+	db.QueryRow(queryCount, args...).Scan(&total)
+
+	stickyCidsStr := getOption(db, "sticky_cids", "")
+	orderBy := "t.created DESC"
+	if stickyCidsStr != "" {
+		isSafe := true
+		for _, r := range stickyCidsStr {
+			if (r < '0' || r > '9') && r != ',' {
+				isSafe = false
+				break
+			}
+		}
+		if isSafe {
+			orderBy = fmt.Sprintf("CASE WHEN t.cid IN (%s) THEN 1 ELSE 0 END DESC, t.created DESC", stickyCidsStr)
+		}
+	}
+
+	queryList += " ORDER BY " + orderBy + " LIMIT ? OFFSET ?"
+	args = append(args, pageSize, (page-1)*pageSize)
+
+	var posts []Post
+	rows, err := db.Query(queryList, args...)
+	if err != nil {
+		return nil, 0
+	}
+	defer rows.Close()
+	stickyMap := make(map[int]bool)
+	if stickyCidsStr != "" {
+		for _, s := range strings.Split(stickyCidsStr, ",") {
+			var id int
+			fmt.Sscan(s, &id)
+			if id > 0 {
+				stickyMap[id] = true
+			}
+		}
+	}
+
+	for rows.Next() {
+		var p Post
+		rows.Scan(&p.Cid, &p.Title, &p.Slug, &p.Created, &p.Text, &p.CommentsNum, &p.AuthorId, &p.Author)
+		if p.Author == "" {
+			p.Author = "admin"
+		}
+		p.Categories = getPostCategories(db, p.Cid)
+		p.IsTop = stickyMap[p.Cid]
+		posts = append(posts, p)
+	}
+	return posts, total
+}
+
+func getPostsByCategory(db *sql.DB, page, pageSize int, slug string) ([]Post, int) {
+	var total int
+	db.QueryRow(`
+		SELECT COUNT(*) FROM typecho_contents c 
+		JOIN typecho_relationships r ON c.cid = r.cid 
+		JOIN typecho_metas m ON r.mid = m.mid 
+		WHERE c.type='post' AND c.status='publish' AND m.type='category' AND m.slug=?`, slug).Scan(&total)
+
+	offset := (page - 1) * pageSize
+	var posts []Post
+	stickyCidsStr := getOption(db, "sticky_cids", "")
+	orderBy := "c.created DESC"
+	if stickyCidsStr != "" {
+		isSafe := true
+		for _, r := range stickyCidsStr {
+			if (r < '0' || r > '9') && r != ',' {
+				isSafe = false
+				break
+			}
+		}
+		if isSafe {
+			orderBy = fmt.Sprintf("CASE WHEN c.cid IN (%s) THEN 1 ELSE 0 END DESC, c.created DESC", stickyCidsStr)
+		}
+	}
+
+	rows, err := db.Query(`
+		SELECT c.cid, c.title, c.slug, c.created, c.text, c.commentsNum 
+		FROM typecho_contents c 
+		JOIN typecho_relationships r ON c.cid = r.cid 
+		JOIN typecho_metas m ON r.mid = m.mid 
+		WHERE c.type='post' AND c.status='publish' AND m.type='category' AND m.slug=? 
+		ORDER BY `+orderBy+` LIMIT ? OFFSET ?`, slug, pageSize, offset)
+	if err != nil {
+		return nil, 0
+	}
+	defer rows.Close()
+	stickyMap := make(map[int]bool)
+	if stickyCidsStr != "" {
+		for _, s := range strings.Split(stickyCidsStr, ",") {
+			var id int
+			fmt.Sscan(s, &id)
+			if id > 0 {
+				stickyMap[id] = true
+			}
+		}
+	}
+
+	for rows.Next() {
+		var p Post
+		rows.Scan(&p.Cid, &p.Title, &p.Slug, &p.Created, &p.Text, &p.CommentsNum)
+		p.Categories = getPostCategories(db, p.Cid)
+		p.IsTop = stickyMap[p.Cid]
+		posts = append(posts, p)
+	}
+	return posts, total
+}
+
+func getPostsByYearMonth(db *sql.DB, page, pageSize int, year, month int) ([]Post, int) {
+	var total int
+	yearStr := fmt.Sprintf("%04d", year)
+	monthStr := fmt.Sprintf("%02d", month)
+
+	db.QueryRow(`
+		SELECT COUNT(*) FROM typecho_contents t
+		WHERE t.type='post' AND t.status='publish'
+		AND strftime('%Y', datetime(t.created, 'unixepoch', 'localtime'))=?
+		AND strftime('%m', datetime(t.created, 'unixepoch', 'localtime'))=?
+		AND t.cid NOT IN (SELECT cid FROM typecho_relationships r JOIN go_category_settings s ON r.mid = s.mid WHERE s.show_on_home = 0 OR s.is_offline = 1)
+	`, yearStr, monthStr).Scan(&total)
+
+	offset := (page - 1) * pageSize
+	stickyCidsStr := getOption(db, "sticky_cids", "")
+	orderBy := "t.created DESC"
+	if stickyCidsStr != "" {
+		isSafe := true
+		for _, r := range stickyCidsStr {
+			if (r < '0' || r > '9') && r != ',' {
+				isSafe = false
+				break
+			}
+		}
+		if isSafe {
+			orderBy = fmt.Sprintf("CASE WHEN t.cid IN (%s) THEN 1 ELSE 0 END DESC, t.created DESC", stickyCidsStr)
+		}
+	}
+
+	rows, err := db.Query(`
+		SELECT t.cid, t.title, t.slug, t.created, t.text, t.commentsNum, t.authorId, u.screenName
+		FROM typecho_contents t
+		LEFT JOIN typecho_users u ON t.authorId = u.uid
+		WHERE t.type='post' AND t.status='publish'
+		AND strftime('%Y', datetime(t.created, 'unixepoch', 'localtime'))=?
+		AND strftime('%m', datetime(t.created, 'unixepoch', 'localtime'))=?
+		AND t.cid NOT IN (SELECT cid FROM typecho_relationships r JOIN go_category_settings s ON r.mid = s.mid WHERE s.show_on_home = 0 OR s.is_offline = 1)
+		ORDER BY `+orderBy+` LIMIT ? OFFSET ?`, yearStr, monthStr, pageSize, offset)
+	if err != nil {
+		return nil, 0
+	}
+	defer rows.Close()
+
+	stickyMap := make(map[int]bool)
+	if stickyCidsStr != "" {
+		for _, s := range strings.Split(stickyCidsStr, ",") {
+			var id int
+			fmt.Sscan(s, &id)
+			if id > 0 {
+				stickyMap[id] = true
+			}
+		}
+	}
+
+	var posts []Post
+	for rows.Next() {
+		var p Post
+		rows.Scan(&p.Cid, &p.Title, &p.Slug, &p.Created, &p.Text, &p.CommentsNum, &p.AuthorId, &p.Author)
+		if p.Author == "" {
+			p.Author = "admin"
+		}
+		p.Categories = getPostCategories(db, p.Cid)
+		p.IsTop = stickyMap[p.Cid]
+		posts = append(posts, p)
+	}
+	return posts, total
+}
+
+func getRecentPostsSidebar(db *sql.DB, catSlug string) []Post {
+	limit := getOptionInt(db, "recentPostsSize", 15)
+	var posts []Post
+	var rows *sql.Rows
+	var err error
+
+	stickyCidsStr := getOption(db, "sticky_cids", "")
+	isSafe := true
+	if stickyCidsStr != "" {
+		for _, r := range stickyCidsStr {
+			if (r < '0' || r > '9') && r != ',' {
+				isSafe = false
+				break
+			}
+		}
+	} else {
+		isSafe = false
+	}
+
+	if catSlug != "" {
+		// Only from current category
+		orderBy := "t.created DESC"
+		if isSafe {
+			orderBy = fmt.Sprintf("CASE WHEN t.cid IN (%s) THEN 1 ELSE 0 END DESC, t.created DESC", stickyCidsStr)
+		}
+		rows, err = db.Query(`SELECT t.cid, t.title, t.slug, t.created, t.text, t.commentsNum 
+                               FROM typecho_contents t
+                               JOIN typecho_relationships r ON t.cid = r.cid
+                               JOIN typecho_metas m ON r.mid = m.mid
+                               LEFT JOIN go_category_settings s ON m.mid = s.mid
+                               WHERE t.type='post' AND t.status='publish' AND m.type='category' AND m.slug=?
+                               AND COALESCE(s.is_offline, 0) = 0
+                               ORDER BY `+orderBy+` LIMIT ?`, catSlug, limit)
+	} else {
+		// Use homepage allow-list logic
+		orderBy := "created DESC"
+		if isSafe {
+			orderBy = fmt.Sprintf("CASE WHEN cid IN (%s) THEN 1 ELSE 0 END DESC, created DESC", stickyCidsStr)
+		}
+		rows, err = db.Query(`SELECT cid, title, slug, created, text, commentsNum 
+                              FROM typecho_contents 
+                              WHERE type='post' AND status='publish' 
+                              AND cid NOT IN (SELECT cid FROM typecho_relationships r JOIN go_category_settings s ON r.mid = s.mid WHERE s.show_on_home = 0 OR s.is_offline = 1)
+                              ORDER BY `+orderBy+` LIMIT ?`, limit)
+	}
+
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	stickyMap := make(map[int]bool)
+	if stickyCidsStr != "" {
+		for _, s := range strings.Split(stickyCidsStr, ",") {
+			var id int
+			fmt.Sscan(s, &id)
+			if id > 0 {
+				stickyMap[id] = true
+			}
+		}
+	}
+
+	for rows.Next() {
+		var p Post
+		rows.Scan(&p.Cid, &p.Title, &p.Slug, &p.Created, &p.Text, &p.CommentsNum)
+		p.IsTop = stickyMap[p.Cid]
+		posts = append(posts, p)
+	}
+	return posts
+}
+
+func getPostCategories(db *sql.DB, cid int) []Category {
+	var cats []Category
+	rows, err := db.Query(`
+		SELECT m.mid, m.name, m.slug 
+		FROM typecho_metas m 
+		JOIN typecho_relationships r ON m.mid = r.mid 
+		WHERE r.cid = ? AND m.type = 'category'`, cid)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cat Category
+		rows.Scan(&cat.Mid, &cat.Name, &cat.Slug)
+		cats = append(cats, cat)
+	}
+	return cats
+}
+
+func getCategories(db *sql.DB) []Category {
+	var cats []Category
+	rows, _ := db.Query(`SELECT m.mid, m.name, m.slug 
+                       FROM typecho_metas m
+                       LEFT JOIN go_category_settings s ON m.mid = s.mid
+                       WHERE m.type='category' AND COALESCE(s.is_offline, 0) = 0
+                       ORDER BY m."order" ASC, m.mid ASC`)
+	defer rows.Close()
+	for rows.Next() {
+		var cat Category
+		rows.Scan(&cat.Mid, &cat.Name, &cat.Slug)
+		cats = append(cats, cat)
+	}
+	return cats
+}
+
+func getRecentComments(db *sql.DB, catSlug string) []Comment {
+	limit := getOptionInt(db, "recentCommentsSize", 10)
+	var comms []Comment
+	var rows *sql.Rows
+	var err error
+
+	if catSlug != "" {
+		// Only from posts in this category
+		rows, err = db.Query(`SELECT c.coid, c.cid, c.author, c.text, c.created 
+                               FROM typecho_comments c
+                               JOIN typecho_relationships r ON c.cid = r.cid
+                               JOIN typecho_metas m ON r.mid = m.mid
+                               WHERE c.status='approved' AND c.type='comment' AND m.type='category' AND m.slug=?
+                               ORDER BY c.created DESC LIMIT ?`, catSlug, limit)
+	} else {
+		// Publicly visible posts only (homepage allowed & not offline)
+		rows, err = db.Query(`SELECT coid, cid, author, text, created 
+                              FROM typecho_comments 
+                              WHERE status='approved' AND type='comment'
+                              AND cid NOT IN (SELECT cid FROM typecho_relationships r JOIN go_category_settings s ON r.mid = s.mid WHERE s.show_on_home = 0 OR s.is_offline = 1)
+                              ORDER BY created DESC LIMIT ?`, limit)
+	}
+
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var comm Comment
+		rows.Scan(&comm.Coid, &comm.Cid, &comm.Author, &comm.Text, &comm.Created)
+
+		runes := []rune(comm.Text)
+		if len(runes) > 35 {
+			comm.Text = string(runes[:35]) + "..."
+		}
+		comms = append(comms, comm)
+	}
+	return comms
+}
+
+func getDateArchives(db *sql.DB, limit int) []DateArchiveItem {
+	rows, err := db.Query(`
+		SELECT 
+			CAST(strftime('%Y', datetime(created, 'unixepoch', 'localtime')) AS INTEGER) AS y,
+			CAST(strftime('%m', datetime(created, 'unixepoch', 'localtime')) AS INTEGER) AS m,
+			COUNT(*)
+		FROM typecho_contents
+		WHERE type='post' AND status='publish'
+		AND cid NOT IN (SELECT cid FROM typecho_relationships r JOIN go_category_settings s ON r.mid = s.mid WHERE s.show_on_home = 0 OR s.is_offline = 1)
+		GROUP BY y, m
+		ORDER BY y DESC, m DESC
+		LIMIT ?`, limit)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+
+	var archives []DateArchiveItem
+	for rows.Next() {
+		var item DateArchiveItem
+		rows.Scan(&item.Year, &item.Month, &item.Count)
+		item.URL = fmt.Sprintf("/blog/index.php/%04d/%02d/", item.Year, item.Month)
+		item.Label = fmt.Sprintf("%04d年%02d月", item.Year, item.Month)
+		archives = append(archives, item)
+	}
+	return archives
+}
+
+func getPostTags(db *sql.DB, cid int) []Tag {
+	var tags []Tag
+	rows, err := db.Query(`
+		SELECT m.name, m.slug 
+		FROM typecho_metas m 
+		JOIN typecho_relationships r ON m.mid = r.mid 
+		WHERE r.cid = ? AND m.type = 'tag'`, cid)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var t Tag
+		rows.Scan(&t.Name, &t.Slug)
+		tags = append(tags, t)
+	}
+	return tags
+}
+
+func getPostComments(db *sql.DB, cid int) []Comment {
+	var comms []*Comment
+	rows, err := db.Query(`
+		SELECT coid, parent, author, text, created 
+		FROM typecho_comments 
+		WHERE cid = ? AND status = 'approved' AND type = 'comment' 
+		ORDER BY created ASC, coid ASC`, cid)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	commentMap := make(map[int]*Comment)
+	roots := make([]*Comment, 0)
+	for rows.Next() {
+		c := &Comment{}
+		rows.Scan(&c.Coid, &c.Parent, &c.Author, &c.Text, &c.Created)
+		commentMap[c.Coid] = c
+		comms = append(comms, c)
+	}
+
+	for _, comment := range comms {
+		if comment.Parent <= 0 {
+			roots = append(roots, comment)
+			continue
+		}
+		if parent, ok := commentMap[comment.Parent]; ok {
+			comment.ParentAuthor = parent.Author
+			parent.Replies = append(parent.Replies, comment)
+			continue
+		}
+		roots = append(roots, comment)
+	}
+	result := make([]Comment, 0, len(roots))
+	for _, root := range roots {
+		result = append(result, *root)
+	}
+	return result
+}
+
+func getPrevNextPosts(db *sql.DB, created int64) (*Post, *Post) {
+	var prev, next *Post
+
+	// Prev
+	var p Post
+	err := db.QueryRow(`SELECT cid, title FROM typecho_contents 
+                         WHERE type='post' AND status='publish' AND created < ? 
+                         AND cid NOT IN (SELECT cid FROM typecho_relationships r JOIN go_category_settings s ON r.mid = s.mid WHERE s.is_offline = 1)
+                         ORDER BY created DESC LIMIT 1`, created).Scan(&p.Cid, &p.Title)
+	if err == nil {
+		prev = &p
+	}
+
+	// Next
+	var n Post
+	err = db.QueryRow(`SELECT cid, title FROM typecho_contents 
+                        WHERE type='post' AND status='publish' AND created > ? 
+                        AND cid NOT IN (SELECT cid FROM typecho_relationships r JOIN go_category_settings s ON r.mid = s.mid WHERE s.is_offline = 1)
+                        ORDER BY created ASC LIMIT 1`, created).Scan(&n.Cid, &n.Title)
+	if err == nil {
+		next = &n
+	}
+
+	return prev, next
+}
+
+func stripThinkingOutput(content string) string {
+	thinkBlockRE := regexp.MustCompile(`(?is)<think\b[^>]*>.*?</think>`)
+	codeFenceRE := regexp.MustCompile("(?is)```(?:[a-z0-9_+-]+)?\\s*(.*?)\\s*```")
+
+	cleaned := thinkBlockRE.ReplaceAllString(content, " ")
+	cleaned = codeFenceRE.ReplaceAllString(cleaned, "$1")
+
+	return strings.TrimSpace(cleaned)
+}
+
+func extractSpamScore(content string) (int, bool) {
+	cleaned := stripThinkingOutput(content)
+	scoreRE := regexp.MustCompile(`\b([0-9])\b`)
+	match := scoreRE.FindStringSubmatch(cleaned)
+	if len(match) < 2 {
+		return 0, false
+	}
+
+	score, err := strconv.Atoi(match[1])
+	if err != nil {
+		return 0, false
+	}
+
+	return score, true
+}
+
+func checkSpamAI(words string, apiKey string, apiUrl string, model string) (int, error) {
+	if apiKey == "" || apiUrl == "" || model == "" {
+		return 0, fmt.Errorf("ai moderation config missing")
+	}
+
+	systemPrompt := "You are an assistant for detecting spam, advertisements, meaningless text, political content, religious content, and malicious content such as SQL injection or XSS. Score user input from 0 to 9, where 0 means safe (e.g., programming or server-related), 5 means suspicious, and 9 means confirmed spam, ads, political or religious content, attacks, or nonsense like \"asdf\", \"12345\", \"aaaa\". If the input is not in English or Chinese, score it as 9. Only return a single integer (0–9) with no explanation."
+
+	requestData := map[string]interface{}{
+		"model": model,
+		"messages": []map[string]string{
+			{"role": "system", "content": systemPrompt},
+			{"role": "user", "content": words},
+		},
+		"max_tokens":  1,
+		"temperature": 0.1,
+	}
+
+	jsonData, _ := json.Marshal(requestData)
+	client := &http.Client{Timeout: 5 * time.Second}
+	req, _ := http.NewRequest("POST", apiUrl, bytes.NewBuffer(jsonData))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == 200 {
+		var result struct {
+			Choices []struct {
+				Message struct {
+					Content string `json:"content"`
+				} `json:"message"`
+			} `json:"choices"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&result); err == nil && len(result.Choices) > 0 {
+			content := strings.TrimSpace(result.Choices[0].Message.Content)
+			if score, ok := extractSpamScore(content); ok {
+				return score, nil
+			}
+			return 0, fmt.Errorf("ai moderation response invalid")
+		}
+		return 0, fmt.Errorf("ai moderation decode failed")
+	}
+
+	return 0, fmt.Errorf("ai moderation status: %d", resp.StatusCode)
+}
