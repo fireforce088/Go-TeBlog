@@ -114,9 +114,70 @@
 
     <div id="body">
         <div class="container">
-            <div class="row">
+            <div class="home-layout">
 
-                <div class="col-mb-12 col-8" id="main" role="main">
+                <aside class="home-left" role="complementary">
+                    <div class="home-left-inner">
+                        <section class="widget home-profile">
+                            <h1 class="home-site-title"><a href="/blog">{{.Site.Title}}</a></h1>
+                            {{if .Site.Description}}
+                            <p class="home-site-description">{{.Site.Description}}</p>
+                            {{end}}
+                        </section>
+
+                        <section class="widget home-search-widget">
+                            <form class="home-search" method="post" action="/blog/" role="search">
+                                <label for="home-s" class="sr-only">Search keyword</label>
+                                <input type="text" id="home-s" name="s" class="text" placeholder="Search" {{if .SearchQuery}}value="{{.SearchQuery}}" {{end}} />
+                                <button type="submit" class="submit">Search</button>
+                            </form>
+                        </section>
+
+                        <section class="widget home-nav-widget">
+                            <h3 class="widget-title">Categories</h3>
+                            <nav class="home-side-nav" aria-label="Categories">
+                                <a{{if eq .CurrentSlug "" }} class="current" {{end}} href="/blog">Home</a>
+                                {{range .Categories}}
+                                <a{{if eq $.CurrentSlug .Slug}} class="current" {{end}} href="{{catPermalink .}}"
+                                    title="{{.Name}}">{{.Name}}</a>
+                                {{end}}
+                            </nav>
+                        </section>
+
+                        <section class="widget">
+                            <h3 class="widget-title">最新文章</h3>
+                            <ul class="widget-list">
+                                {{range .RecentPosts}}
+                                <li><a href="{{permalink .}}">{{.Title}}</a></li>
+                                {{end}}
+                            </ul>
+                        </section>
+
+                        <section class="widget">
+                            <h3 class="widget-title">最近评论</h3>
+                            <ul class="widget-list">
+                                {{range .RecentComments}}
+                                <li class="comment-item">
+                                    <a href="{{commPermalink .}}">{{.Author}}</a>: {{.Text}}
+                                </li>
+                                {{end}}
+                            </ul>
+                        </section>
+
+                        {{if .ShowDateArchive}}
+                        <section class="widget">
+                            <h3 class="widget-title">日期归档</h3>
+                            <ul class="widget-list archive-list">
+                                {{range .DateArchives}}
+                                <li><a href="{{.URL}}">{{.Label}}</a> ({{.Count}})</li>
+                                {{end}}
+                            </ul>
+                        </section>
+                        {{end}}
+                    </div>
+                </aside>
+
+                <div class="home-main" id="main" role="main">
                     {{if .ArchiveTitle}}
                     <h3 class="archive-title">{{.ArchiveTitle}}</h3>
                     {{end}}
@@ -208,7 +269,8 @@
                     {{end}}
                 </div><!-- end #main-->
 
-                <div class="col-mb-12 col-4 kit-hidden-tb" id="secondary" role="complementary">
+                <div class="home-right" id="secondary" role="complementary">
+                    <div class="home-right-inner">
                     <section class="widget">
                         <h3 class="widget-title">最新文章</h3>
                         <ul class="widget-list">
@@ -239,10 +301,11 @@
                         </ul>
                     </section>
                     {{end}}
+                    </div>
 
                 </div><!-- end #sidebar -->
 
-            </div><!-- end .row -->
+            </div><!-- end .home-layout -->
         </div>
     </div><!-- end #body -->
 

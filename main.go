@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"context"
 	"database/sql"
 	"encoding/json"
 	"encoding/xml"
@@ -15,14 +14,12 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
-	"os/signal"
 	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -1014,7 +1011,7 @@ func main() {
 	// 核心逻辑：动态后台路径的反向代理
 	// 前台服务 (8190) 监听所有流量，发现匹配 adminPath 时中转给后台 (8191)
 	handleProxy := func(c *gin.Context) {
-		target, _ := url.Parse("http://127.0.0.1:8191")
+		target, _ := url.Parse("http://0.0.0.0:8191")
 		proxy := httputil.NewSingleHostReverseProxy(target)
 		proxy.ServeHTTP(c.Writer, c.Request)
 	}
@@ -1641,34 +1638,15 @@ func main() {
 	r.GET("/api/stats/beacon", handleBeacon)
 
 	srv := &http.Server{
-		Addr:    "127.0.0.1:8190",
+		Addr:    "0.0.0.0:8190",
 		Handler: r,
 	}
 
-	// 监听信号的通道
-	quit := make(chan os.Signal, 1)
-	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-
-	go func() {
-		fmt.Println("Server starting on :8190")
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("listen: %s\n", err)
-		}
-	}()
-
-	// 等待退出信号
-	<-quit
-	log.Println("Shutting down server...")
-
-	// 1. 先关闭 HTTP 服务，停止接收新请求
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if err := srv.Shutdown(ctx); err != nil {
-		log.Fatal("Server forced to shutdown:", err)
+	fmt.Println("Server starting on :8190")
+	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		log.Fatalf("listen: %s\n", err)
 	}
 	close(cfShieldStop)
-
-	// 2. 关闭统计通道并等待数据写完
 	log.Println("Waiting for statistics worker to finish...")
 	close(statsChan)
 	statsWG.Wait()

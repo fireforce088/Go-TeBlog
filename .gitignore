@@ -2,6 +2,8 @@
 blog_app
 admin_app
 migrator
+go-teblog
+go-teblog-binary
 *.exe
 *.exe~
 *.dll
@@ -14,7 +16,7 @@ migrator
 vendor/
 go.work
 go.work.sum
-go.sum
+.tmp/
 
 # Database - Local data should not be committed
 blog.sqlite
@@ -42,6 +44,10 @@ backups/
 # OS files
 .DS_Store
 Thumbs.db
+desktop.ini
+
+# Local test content
+md/
 
 # Site-specific verification/config (Commonly personalized)
 static/BingSiteAuth.xml
