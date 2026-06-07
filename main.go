@@ -616,9 +616,10 @@ type Post struct {
 }
 
 type Category struct {
-	Mid  int
-	Name string
-	Slug string
+	Mid   int
+	Name  string
+	Slug  string
+	Posts []Post
 }
 
 type Comment struct {
@@ -2413,18 +2414,60 @@ func getPostCategories(db *sql.DB, cid int) []Category {
 
 func getCategories(db *sql.DB) []Category {
 	var cats []Category
-	rows, _ := db.Query(`SELECT m.mid, m.name, m.slug 
+	rows, err := db.Query(`SELECT m.mid, m.name, m.slug
                        FROM typecho_metas m
                        LEFT JOIN go_category_settings s ON m.mid = s.mid
                        WHERE m.type='category' AND COALESCE(s.is_offline, 0) = 0
                        ORDER BY m."order" ASC, m.mid ASC`)
+	if err != nil {
+		return nil
+	}
 	defer rows.Close()
 	for rows.Next() {
 		var cat Category
 		rows.Scan(&cat.Mid, &cat.Name, &cat.Slug)
 		cats = append(cats, cat)
 	}
+	fillCategoryPosts(db, cats)
 	return cats
+}
+
+func fillCategoryPosts(db *sql.DB, cats []Category) {
+	if len(cats) == 0 {
+		return
+	}
+
+	rows, err := db.Query(`
+		SELECT m.mid, c.cid, c.title, c.slug, c.created, c.text, c.commentsNum
+		FROM typecho_metas m
+		JOIN typecho_relationships r ON m.mid = r.mid
+		JOIN typecho_contents c ON r.cid = c.cid
+		LEFT JOIN go_category_settings s ON m.mid = s.mid
+		WHERE m.type='category'
+		AND c.type='post'
+		AND c.status='publish'
+		AND COALESCE(s.is_offline, 0) = 0
+		ORDER BY m."order" ASC, m.mid ASC, c.created DESC`)
+	if err != nil {
+		return
+	}
+	defer rows.Close()
+
+	catByMid := make(map[int]*Category, len(cats))
+	for i := range cats {
+		catByMid[cats[i].Mid] = &cats[i]
+	}
+
+	for rows.Next() {
+		var mid int
+		var p Post
+		if err := rows.Scan(&mid, &p.Cid, &p.Title, &p.Slug, &p.Created, &p.Text, &p.CommentsNum); err != nil {
+			continue
+		}
+		if cat, ok := catByMid[mid]; ok {
+			cat.Posts = append(cat.Posts, p)
+		}
+	}
 }
 
 func getRecentComments(db *sql.DB, catSlug string) []Comment {

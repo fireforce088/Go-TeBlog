@@ -123,9 +123,58 @@
 
     <div id="body">
         <div class="container">
-            <div class="row">
+            <div class="home-layout">
 
-                <div class="col-mb-12 col-8" id="main" role="main">
+                <aside class="home-left" role="complementary">
+                    <div class="home-left-inner">
+                        <section class="widget home-profile">
+                            <h1 class="home-site-title"><a href="/blog">{{.Site.Title}}</a></h1>
+                            {{if .Site.Description}}
+                            <p class="home-site-description">{{.Site.Description}}</p>
+                            {{end}}
+                        </section>
+
+                        <section class="widget home-search-widget">
+                            <form class="home-search" method="post" action="/blog/" role="search">
+                                <label for="home-s" class="sr-only">Search keyword</label>
+                                <input type="text" id="home-s" name="s" class="text" placeholder="Search" />
+                                <button type="submit" class="submit">Search</button>
+                            </form>
+                        </section>
+
+                        <section class="widget home-nav-widget">
+                            <h3 class="widget-title">Categories</h3>
+                            <nav class="home-side-nav" aria-label="Categories">
+                                <a{{if eq .CurrentSlug "" }} class="current" {{end}} href="/blog">Home</a>
+                                {{range .Categories}}
+                                <div class="category-group{{if eq $.CurrentSlug .Slug}} current{{end}}">
+                                    <a{{if eq $.CurrentSlug .Slug}} class="current" {{end}} href="{{catPermalink .}}" title="{{.Name}}">{{.Name}}</a>
+                                    {{if .Posts}}
+                                    <div class="category-posts">
+                                        {{range .Posts}}
+                                        <a{{if eq $.Post.Cid .Cid}} class="active" {{end}} href="{{permalink .}}" title="{{.Title}}">{{.Title}}</a>
+                                        {{end}}
+                                    </div>
+                                    {{end}}
+                                </div>
+                                {{end}}
+                            </nav>
+                        </section>
+                    </div>
+                </aside>
+
+                <aside class="home-middle" role="navigation" aria-label="Article list">
+                    <section class="widget article-index-widget">
+                        <h3 class="widget-title">Articles</h3>
+                        <ul class="article-index-list">
+                            {{range .RecentPosts}}
+                            <li><a{{if eq $.Post.Cid .Cid}} class="active" {{end}} href="{{permalink .}}" title="{{.Title}}">{{.Title}}</a></li>
+                            {{end}}
+                        </ul>
+                    </section>
+                </aside>
+
+                <div class="home-main" id="main" role="main">
                     <article class="post" itemscope itemtype="http://schema.org/BlogPosting">
                         <h1 class="post-title" itemprop="name headline">
                             {{if .Post.IsTop}}<span class="sticky-badge" title="置顶"><i class="fas fa-thumbtack"></i></span> {{end}}<a itemprop="url" href="{{permalink .Post}}">{{.Post.Title}}</a>
@@ -208,7 +257,7 @@
                     </ul>
                 </div><!-- end #main-->
 
-                <div class="col-mb-12 col-4 kit-hidden-tb" id="secondary" role="complementary">
+                <div class="home-right" id="secondary" role="complementary">
                     <section class="widget">
                         <h3 class="widget-title">最新文章</h3>
                         <ul class="widget-list">
@@ -230,7 +279,7 @@
                     </section>
                 </div><!-- end #sidebar -->
 
-            </div><!-- end .row -->
+            </div><!-- end .home-layout -->
         </div>
     </div><!-- end #body -->
 

@@ -138,8 +138,17 @@
                             <nav class="home-side-nav" aria-label="Categories">
                                 <a{{if eq .CurrentSlug "" }} class="current" {{end}} href="/blog">Home</a>
                                 {{range .Categories}}
-                                <a{{if eq $.CurrentSlug .Slug}} class="current" {{end}} href="{{catPermalink .}}"
-                                    title="{{.Name}}">{{.Name}}</a>
+                                <div class="category-group{{if eq $.CurrentSlug .Slug}} current{{end}}">
+                                    <a{{if eq $.CurrentSlug .Slug}} class="current" {{end}} href="{{catPermalink .}}"
+                                        title="{{.Name}}">{{.Name}}</a>
+                                    {{if .Posts}}
+                                    <div class="category-posts">
+                                        {{range .Posts}}
+                                        <a href="{{permalink .}}" title="{{.Title}}">{{.Title}}</a>
+                                        {{end}}
+                                    </div>
+                                    {{end}}
+                                </div>
                                 {{end}}
                             </nav>
                         </section>
@@ -175,6 +184,21 @@
                         </section>
                         {{end}}
                     </div>
+                </aside>
+
+                <aside class="home-middle" role="navigation" aria-label="Article list">
+                    <section class="widget article-index-widget">
+                        <h3 class="widget-title">{{if .ArchiveTitle}}{{.ArchiveTitle}}{{else}}Articles{{end}}</h3>
+                        <ul class="article-index-list">
+                            {{range .Posts}}
+                            <li>
+                                <a href="{{permalink .}}" title="{{.Title}}">{{.Title}}</a>
+                            </li>
+                            {{else}}
+                            <li class="empty">No articles</li>
+                            {{end}}
+                        </ul>
+                    </section>
                 </aside>
 
                 <div class="home-main" id="main" role="main">
