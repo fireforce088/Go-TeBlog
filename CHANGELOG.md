@@ -1,4 +1,17 @@
-﻿# Changelog
+# Changelog
+
+## 0.0.2 - 2026-06-07
+
+### Added
+
+- Added a wide three-column frontend layout for desktop pages.
+- Added expandable category article lists in the frontend sidebar.
+- Added current category and current article highlighting in navigation.
+
+### Changed
+
+- Increased the default frontend content width to better use large screens.
+- Updated the release version to `0.0.2`.
 
 ## 0.0.1 - 2026-06-06
 
