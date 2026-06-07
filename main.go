@@ -26,6 +26,7 @@ import (
 	"github.com/yuin/goldmark"
 	"github.com/yuin/goldmark/extension"
 	"github.com/yuin/goldmark/renderer/html"
+	"golang.org/x/crypto/bcrypt"
 	_ "modernc.org/sqlite"
 )
 
@@ -616,10 +617,12 @@ type Post struct {
 }
 
 type Category struct {
-	Mid   int
-	Name  string
-	Slug  string
-	Posts []Post
+	Mid          int
+	Name         string
+	Slug         string
+	Protected    bool
+	PasswordHash string
+	Posts        []Post
 }
 
 type Comment struct {
@@ -724,6 +727,67 @@ type PageData struct {
 	HasNext         bool
 	PrevPage        int
 	NextPage        int
+}
+
+type categoryAccessInfo struct {
+	Mid          int
+	Name         string
+	Slug         string
+	IsOffline    bool
+	Protected    bool
+	PasswordHash string
+}
+
+func getCategoryAccessInfo(db *sql.DB, slug string) (categoryAccessInfo, bool) {
+	var info categoryAccessInfo
+	var isOffline, protected int
+	err := db.QueryRow(`SELECT m.mid, m.name, m.slug, COALESCE(s.is_offline, 0), COALESCE(s.protected, 0), COALESCE(s.password_hash, '')
+		FROM typecho_metas m
+		LEFT JOIN go_category_settings s ON m.mid = s.mid
+		WHERE m.slug=? AND m.type='category'`, slug).Scan(&info.Mid, &info.Name, &info.Slug, &isOffline, &protected, &info.PasswordHash)
+	if err != nil {
+		return info, false
+	}
+	info.IsOffline = isOffline == 1
+	info.Protected = protected == 1 && strings.TrimSpace(info.PasswordHash) != ""
+	return info, true
+}
+
+func categoryAuthCookieName(mid int) string {
+	return fmt.Sprintf("category_auth_%d", mid)
+}
+
+func hasCategoryAuth(c *gin.Context, mid int) bool {
+	value, err := c.Cookie(categoryAuthCookieName(mid))
+	return err == nil && value == "1"
+}
+
+func setCategoryAuthCookie(c *gin.Context, mid int) {
+	secure := c.Request != nil && c.Request.TLS != nil
+	http.SetCookie(c.Writer, &http.Cookie{
+		Name:     categoryAuthCookieName(mid),
+		Value:    "1",
+		Path:     "/blog",
+		MaxAge:   7 * 24 * 60 * 60,
+		HttpOnly: true,
+		Secure:   secure,
+		SameSite: http.SameSiteLaxMode,
+	})
+}
+
+func renderCategoryPasswordPage(c *gin.Context, db *sql.DB, info categoryAccessInfo, message string, status int) {
+	next := c.PostForm("next")
+	if next == "" {
+		next = c.Request.URL.RequestURI()
+	}
+	c.HTML(status, "category_password.html", gin.H{
+		"Site":        getSiteInfo(db),
+		"Category":    info,
+		"Message":     message,
+		"CurrentSlug": info.Slug,
+		"Categories":  getCategories(db),
+		"Next":        next,
+	})
 }
 
 func statsMiddleware(db *sql.DB, adminPath string) gin.HandlerFunc {
@@ -1294,16 +1358,27 @@ func main() {
 			return
 		}
 
-		// Check if any category of this post is offline
+		// Check if any category of this post is offline or password protected.
 		for _, cat := range post.Categories {
-			var isOffline int
-			db.QueryRow("SELECT is_offline FROM go_category_settings WHERE mid=?", cat.Mid).Scan(&isOffline)
+			var isOffline, protected int
+			var passwordHash string
+			db.QueryRow("SELECT COALESCE(is_offline, 0), COALESCE(protected, 0), COALESCE(password_hash, '') FROM go_category_settings WHERE mid=?", cat.Mid).Scan(&isOffline, &protected, &passwordHash)
 			if isOffline == 1 {
 				c.HTML(http.StatusNotFound, "error.html", gin.H{
 					"Site":         site,
 					"ErrorTitle":   "文章不可用",
 					"ErrorMessage": "抱歉，该文章所属分类已下线，暂时无法访问。",
 				})
+				return
+			}
+			if protected == 1 && strings.TrimSpace(passwordHash) != "" && !hasCategoryAuth(c, cat.Mid) {
+				renderCategoryPasswordPage(c, db, categoryAccessInfo{
+					Mid:          cat.Mid,
+					Name:         cat.Name,
+					Slug:         cat.Slug,
+					Protected:    true,
+					PasswordHash: passwordHash,
+				}, "", http.StatusUnauthorized)
 				return
 			}
 		}
@@ -1340,6 +1415,31 @@ func main() {
 		cidStr := c.Param("cid")
 		var cid int
 		fmt.Sscanf(cidStr, "%d", &cid)
+
+		for _, cat := range getPostCategories(db, cid) {
+			var isOffline, protected int
+			var passwordHash string
+			db.QueryRow("SELECT COALESCE(is_offline, 0), COALESCE(protected, 0), COALESCE(password_hash, '') FROM go_category_settings WHERE mid=?", cat.Mid).Scan(&isOffline, &protected, &passwordHash)
+			if isOffline == 1 {
+				site := getSiteInfo(db)
+				c.HTML(http.StatusNotFound, "error.html", gin.H{
+					"Site":         site,
+					"ErrorTitle":   "文章不可用",
+					"ErrorMessage": "抱歉，该文章所属分类已下线，暂时无法访问。",
+				})
+				return
+			}
+			if protected == 1 && strings.TrimSpace(passwordHash) != "" && !hasCategoryAuth(c, cat.Mid) {
+				renderCategoryPasswordPage(c, db, categoryAccessInfo{
+					Mid:          cat.Mid,
+					Name:         cat.Name,
+					Slug:         cat.Slug,
+					Protected:    true,
+					PasswordHash: passwordHash,
+				}, "", http.StatusUnauthorized)
+				return
+			}
+		}
 
 		// 0. Global Comments Enabled Check
 		if getOption(db, "commentsEnabled", "1") != "1" {
@@ -1491,20 +1591,17 @@ func main() {
 
 		site := getSiteInfo(db)
 
-		// Find category name by slug and check offline status
-		var catName string
-		var isOffline int
-		db.QueryRow(`SELECT m.name, COALESCE(s.is_offline, 0) 
-                     FROM typecho_metas m 
-                     LEFT JOIN go_category_settings s ON m.mid = s.mid 
-                     WHERE m.slug=? AND m.type='category'`, slug).Scan(&catName, &isOffline)
-
-		if catName == "" || isOffline == 1 {
+		info, ok := getCategoryAccessInfo(db, slug)
+		if !ok || info.IsOffline {
 			c.HTML(http.StatusNotFound, "error.html", gin.H{
 				"Site":         site,
 				"ErrorTitle":   "分类不存在",
 				"ErrorMessage": "抱歉，您访问的分类不存在或已被下线。",
 			})
+			return
+		}
+		if info.Protected && !hasCategoryAuth(c, info.Mid) {
+			renderCategoryPasswordPage(c, db, info, "", http.StatusUnauthorized)
 			return
 		}
 
@@ -1528,7 +1625,7 @@ func main() {
 			RecentComments:  recentComments,
 			ShowDateArchive: showDateArchive,
 			DateArchives:    dateArchives,
-			ArchiveTitle:    fmt.Sprintf("分类 %s 下的文章", catName),
+			ArchiveTitle:    fmt.Sprintf("分类 %s 下的文章", info.Name),
 			PaginationBase:  fmt.Sprintf("/blog/index.php/category/%s/", slug),
 			CurrentSlug:     slug,
 			CurrentPage:     page,
@@ -1538,6 +1635,34 @@ func main() {
 			PrevPage:        page - 1,
 			NextPage:        page + 1,
 		})
+	}
+
+	handleCategoryPassword := func(c *gin.Context) {
+		slug := c.Param("slug")
+		info, ok := getCategoryAccessInfo(db, slug)
+		if !ok || info.IsOffline {
+			c.HTML(http.StatusNotFound, "error.html", gin.H{
+				"Site":         getSiteInfo(db),
+				"ErrorTitle":   "分类不存在",
+				"ErrorMessage": "抱歉，您访问的分类不存在或已被下线。",
+			})
+			return
+		}
+		if !info.Protected {
+			c.Redirect(http.StatusFound, fmt.Sprintf("/blog/index.php/category/%s/", slug))
+			return
+		}
+		password := c.PostForm("password")
+		if bcrypt.CompareHashAndPassword([]byte(info.PasswordHash), []byte(password)) != nil {
+			renderCategoryPasswordPage(c, db, info, "密码错误，请重试。", http.StatusUnauthorized)
+			return
+		}
+		setCategoryAuthCookie(c, info.Mid)
+		next := c.PostForm("next")
+		if next == "" || !strings.HasPrefix(next, "/blog/") {
+			next = fmt.Sprintf("/blog/index.php/category/%s/", slug)
+		}
+		c.Redirect(http.StatusFound, next)
 	}
 
 	handleDateArchive := func(c *gin.Context) {
@@ -1627,6 +1752,8 @@ func main() {
 	r.GET("/blog/index.php/category/:slug/:page/", handleCategory)
 	r.GET("/blog/index.php/category/:slug/page/:page", handleCategory)
 	r.GET("/blog/index.php/category/:slug/page/:page/", handleCategory)
+	r.POST("/blog/index.php/category/:slug/password", handleCategoryPassword)
+	r.POST("/blog/index.php/category/:slug/password/", handleCategoryPassword)
 	r.GET("/blog/index.php/:year/:month", handleDateArchive)
 	r.GET("/blog/index.php/:year/:month/", handleDateArchive)
 	r.GET("/blog/index.php/:year/:month/page/:page", handleDateArchive)
@@ -1778,7 +1905,9 @@ func initDB(db *sql.DB) {
 		`CREATE TABLE IF NOT EXISTS "go_category_settings" (
 			"mid" INTEGER PRIMARY KEY,
 			"show_on_home" INTEGER DEFAULT 1,
-			"is_offline" INTEGER DEFAULT 0
+			"is_offline" INTEGER DEFAULT 0,
+			"protected" INTEGER DEFAULT 0,
+			"password_hash" TEXT DEFAULT ''
 		)`,
 		`CREATE TABLE IF NOT EXISTS "go_stats_logs" (
 			"id" INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1807,6 +1936,7 @@ func initDB(db *sql.DB) {
 			log.Printf("Error creating table: %v", err)
 		}
 	}
+	ensureCategoryProtectionColumnsMain(db)
 	_, err := db.Exec(`ALTER TABLE go_cf_shield_logs ADD COLUMN blocked_ips TEXT`)
 	if err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
 		log.Printf("Error updating Cloudflare shield logs table: %v", err)
@@ -1842,6 +1972,17 @@ func initDB(db *sql.DB) {
 	}
 
 	// User initialization is now handled by the installer or build script
+}
+
+func ensureCategoryProtectionColumnsMain(db *sql.DB) {
+	for _, stmt := range []string{
+		`ALTER TABLE go_category_settings ADD COLUMN protected INTEGER DEFAULT 0`,
+		`ALTER TABLE go_category_settings ADD COLUMN password_hash TEXT DEFAULT ''`,
+	} {
+		if _, err := db.Exec(stmt); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
+			log.Printf("Error updating category settings table: %v", err)
+		}
+	}
 }
 
 func getSiteInfo(db *sql.DB) SiteInfo {
@@ -1927,7 +2068,7 @@ func buildSitemapEntries(db *sql.DB, req *http.Request) []sitemapURL {
 		AND cid NOT IN (
 			SELECT cid FROM typecho_relationships r
 			JOIN go_category_settings s ON r.mid = s.mid
-			WHERE s.show_on_home = 0 OR s.is_offline = 1
+			WHERE s.show_on_home = 0 OR s.is_offline = 1 OR s.protected = 1
 		)
 		ORDER BY created DESC`)
 	if err == nil {
@@ -1951,7 +2092,7 @@ func buildSitemapEntries(db *sql.DB, req *http.Request) []sitemapURL {
 		SELECT m.slug
 		FROM typecho_metas m
 		LEFT JOIN go_category_settings s ON m.mid = s.mid
-		WHERE m.type='category' AND COALESCE(s.is_offline, 0) = 0
+		WHERE m.type='category' AND COALESCE(s.is_offline, 0) = 0 AND COALESCE(s.protected, 0) = 0
 		ORDER BY m."order" ASC, m.mid ASC`)
 	if err == nil {
 		defer catRows.Close()
@@ -1974,7 +2115,7 @@ func buildSitemapEntries(db *sql.DB, req *http.Request) []sitemapURL {
 		AND cid NOT IN (
 			SELECT cid FROM typecho_relationships r
 			JOIN go_category_settings s ON r.mid = s.mid
-			WHERE s.show_on_home = 0 OR s.is_offline = 1
+			WHERE s.show_on_home = 0 OR s.is_offline = 1 OR s.protected = 1
 		)
 		GROUP BY y, m
 		ORDER BY y DESC, m DESC`)
@@ -2133,12 +2274,12 @@ func getPosts(db *sql.DB, page, pageSize int, search string) ([]Post, int) {
 	var total int
 	queryCount := `SELECT COUNT(*) FROM typecho_contents t 
                    WHERE t.type='post' AND t.status='publish' 
-                   AND t.cid NOT IN (SELECT cid FROM typecho_relationships r JOIN go_category_settings s ON r.mid = s.mid WHERE s.show_on_home = 0 OR s.is_offline = 1)`
+                   AND t.cid NOT IN (SELECT cid FROM typecho_relationships r JOIN go_category_settings s ON r.mid = s.mid WHERE s.show_on_home = 0 OR s.is_offline = 1 OR s.protected = 1)`
 	queryList := `SELECT t.cid, t.title, t.slug, t.created, t.text, t.commentsNum, t.authorId, u.screenName 
                   FROM typecho_contents t 
                   LEFT JOIN typecho_users u ON t.authorId = u.uid 
                   WHERE t.type='post' AND t.status='publish'
-                  AND t.cid NOT IN (SELECT cid FROM typecho_relationships r JOIN go_category_settings s ON r.mid = s.mid WHERE s.show_on_home = 0 OR s.is_offline = 1)`
+                  AND t.cid NOT IN (SELECT cid FROM typecho_relationships r JOIN go_category_settings s ON r.mid = s.mid WHERE s.show_on_home = 0 OR s.is_offline = 1 OR s.protected = 1)`
 	var args []interface{}
 
 	if search != "" {
@@ -2265,7 +2406,7 @@ func getPostsByYearMonth(db *sql.DB, page, pageSize int, year, month int) ([]Pos
 		WHERE t.type='post' AND t.status='publish'
 		AND strftime('%Y', datetime(t.created, 'unixepoch', 'localtime'))=?
 		AND strftime('%m', datetime(t.created, 'unixepoch', 'localtime'))=?
-		AND t.cid NOT IN (SELECT cid FROM typecho_relationships r JOIN go_category_settings s ON r.mid = s.mid WHERE s.show_on_home = 0 OR s.is_offline = 1)
+		AND t.cid NOT IN (SELECT cid FROM typecho_relationships r JOIN go_category_settings s ON r.mid = s.mid WHERE s.show_on_home = 0 OR s.is_offline = 1 OR s.protected = 1)
 	`, yearStr, monthStr).Scan(&total)
 
 	offset := (page - 1) * pageSize
@@ -2291,7 +2432,7 @@ func getPostsByYearMonth(db *sql.DB, page, pageSize int, year, month int) ([]Pos
 		WHERE t.type='post' AND t.status='publish'
 		AND strftime('%Y', datetime(t.created, 'unixepoch', 'localtime'))=?
 		AND strftime('%m', datetime(t.created, 'unixepoch', 'localtime'))=?
-		AND t.cid NOT IN (SELECT cid FROM typecho_relationships r JOIN go_category_settings s ON r.mid = s.mid WHERE s.show_on_home = 0 OR s.is_offline = 1)
+		AND t.cid NOT IN (SELECT cid FROM typecho_relationships r JOIN go_category_settings s ON r.mid = s.mid WHERE s.show_on_home = 0 OR s.is_offline = 1 OR s.protected = 1)
 		ORDER BY `+orderBy+` LIMIT ? OFFSET ?`, yearStr, monthStr, pageSize, offset)
 	if err != nil {
 		return nil, 0
@@ -2365,7 +2506,7 @@ func getRecentPostsSidebar(db *sql.DB, catSlug string) []Post {
 		rows, err = db.Query(`SELECT cid, title, slug, created, text, commentsNum 
                               FROM typecho_contents 
                               WHERE type='post' AND status='publish' 
-                              AND cid NOT IN (SELECT cid FROM typecho_relationships r JOIN go_category_settings s ON r.mid = s.mid WHERE s.show_on_home = 0 OR s.is_offline = 1)
+                              AND cid NOT IN (SELECT cid FROM typecho_relationships r JOIN go_category_settings s ON r.mid = s.mid WHERE s.show_on_home = 0 OR s.is_offline = 1 OR s.protected = 1)
                               ORDER BY `+orderBy+` LIMIT ?`, limit)
 	}
 
@@ -2396,9 +2537,10 @@ func getRecentPostsSidebar(db *sql.DB, catSlug string) []Post {
 func getPostCategories(db *sql.DB, cid int) []Category {
 	var cats []Category
 	rows, err := db.Query(`
-		SELECT m.mid, m.name, m.slug 
+		SELECT m.mid, m.name, m.slug, COALESCE(s.protected, 0), COALESCE(s.password_hash, '')
 		FROM typecho_metas m 
 		JOIN typecho_relationships r ON m.mid = r.mid 
+		LEFT JOIN go_category_settings s ON m.mid = s.mid
 		WHERE r.cid = ? AND m.type = 'category'`, cid)
 	if err != nil {
 		return nil
@@ -2406,7 +2548,9 @@ func getPostCategories(db *sql.DB, cid int) []Category {
 	defer rows.Close()
 	for rows.Next() {
 		var cat Category
-		rows.Scan(&cat.Mid, &cat.Name, &cat.Slug)
+		var protected int
+		rows.Scan(&cat.Mid, &cat.Name, &cat.Slug, &protected, &cat.PasswordHash)
+		cat.Protected = protected == 1 && strings.TrimSpace(cat.PasswordHash) != ""
 		cats = append(cats, cat)
 	}
 	return cats
@@ -2414,7 +2558,7 @@ func getPostCategories(db *sql.DB, cid int) []Category {
 
 func getCategories(db *sql.DB) []Category {
 	var cats []Category
-	rows, err := db.Query(`SELECT m.mid, m.name, m.slug
+	rows, err := db.Query(`SELECT m.mid, m.name, m.slug, COALESCE(s.protected, 0), COALESCE(s.password_hash, '')
                        FROM typecho_metas m
                        LEFT JOIN go_category_settings s ON m.mid = s.mid
                        WHERE m.type='category' AND COALESCE(s.is_offline, 0) = 0
@@ -2425,7 +2569,9 @@ func getCategories(db *sql.DB) []Category {
 	defer rows.Close()
 	for rows.Next() {
 		var cat Category
-		rows.Scan(&cat.Mid, &cat.Name, &cat.Slug)
+		var protected int
+		rows.Scan(&cat.Mid, &cat.Name, &cat.Slug, &protected, &cat.PasswordHash)
+		cat.Protected = protected == 1 && strings.TrimSpace(cat.PasswordHash) != ""
 		cats = append(cats, cat)
 	}
 	fillCategoryPosts(db, cats)
@@ -2447,6 +2593,7 @@ func fillCategoryPosts(db *sql.DB, cats []Category) {
 		AND c.type='post'
 		AND c.status='publish'
 		AND COALESCE(s.is_offline, 0) = 0
+		AND COALESCE(s.protected, 0) = 0
 		ORDER BY m."order" ASC, m.mid ASC, c.created DESC`)
 	if err != nil {
 		return
@@ -2489,7 +2636,7 @@ func getRecentComments(db *sql.DB, catSlug string) []Comment {
 		rows, err = db.Query(`SELECT coid, cid, author, text, created 
                               FROM typecho_comments 
                               WHERE status='approved' AND type='comment'
-                              AND cid NOT IN (SELECT cid FROM typecho_relationships r JOIN go_category_settings s ON r.mid = s.mid WHERE s.show_on_home = 0 OR s.is_offline = 1)
+                              AND cid NOT IN (SELECT cid FROM typecho_relationships r JOIN go_category_settings s ON r.mid = s.mid WHERE s.show_on_home = 0 OR s.is_offline = 1 OR s.protected = 1)
                               ORDER BY created DESC LIMIT ?`, limit)
 	}
 
@@ -2518,7 +2665,7 @@ func getDateArchives(db *sql.DB, limit int) []DateArchiveItem {
 			COUNT(*)
 		FROM typecho_contents
 		WHERE type='post' AND status='publish'
-		AND cid NOT IN (SELECT cid FROM typecho_relationships r JOIN go_category_settings s ON r.mid = s.mid WHERE s.show_on_home = 0 OR s.is_offline = 1)
+		AND cid NOT IN (SELECT cid FROM typecho_relationships r JOIN go_category_settings s ON r.mid = s.mid WHERE s.show_on_home = 0 OR s.is_offline = 1 OR s.protected = 1)
 		GROUP BY y, m
 		ORDER BY y DESC, m DESC
 		LIMIT ?`, limit)
@@ -2603,7 +2750,7 @@ func getPrevNextPosts(db *sql.DB, created int64) (*Post, *Post) {
 	var p Post
 	err := db.QueryRow(`SELECT cid, title FROM typecho_contents 
                          WHERE type='post' AND status='publish' AND created < ? 
-                         AND cid NOT IN (SELECT cid FROM typecho_relationships r JOIN go_category_settings s ON r.mid = s.mid WHERE s.is_offline = 1)
+                         AND cid NOT IN (SELECT cid FROM typecho_relationships r JOIN go_category_settings s ON r.mid = s.mid WHERE s.is_offline = 1 OR s.protected = 1)
                          ORDER BY created DESC LIMIT 1`, created).Scan(&p.Cid, &p.Title)
 	if err == nil {
 		prev = &p
@@ -2613,7 +2760,7 @@ func getPrevNextPosts(db *sql.DB, created int64) (*Post, *Post) {
 	var n Post
 	err = db.QueryRow(`SELECT cid, title FROM typecho_contents 
                         WHERE type='post' AND status='publish' AND created > ? 
-                        AND cid NOT IN (SELECT cid FROM typecho_relationships r JOIN go_category_settings s ON r.mid = s.mid WHERE s.is_offline = 1)
+                        AND cid NOT IN (SELECT cid FROM typecho_relationships r JOIN go_category_settings s ON r.mid = s.mid WHERE s.is_offline = 1 OR s.protected = 1)
                         ORDER BY created ASC LIMIT 1`, created).Scan(&n.Cid, &n.Title)
 	if err == nil {
 		next = &n

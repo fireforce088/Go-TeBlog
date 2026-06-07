@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.0.3 - 2026-06-07
+
+### Added
+
+- Added category password protection with backend route-level access checks.
+- Added admin category controls for enabling access passwords and setting bcrypt-hashed passwords.
+- Added a frontend category password page for protected categories.
+- Added automatic database migration columns: `protected` and `password_hash` in `go_category_settings`.
+
+### Changed
+
+- Excluded protected-category posts from public homepage, search, archive, sitemap, sidebar, and previous/next post listings.
+- Updated the release version to `0.0.3`.
+
 ## 0.0.2 - 2026-06-07
 
 ### Added

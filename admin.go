@@ -24,6 +24,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"golang.org/x/crypto/bcrypt"
 	_ "modernc.org/sqlite"
 )
 
@@ -129,6 +130,17 @@ func sanitizeSkinLength(value, fallback string) string {
 	return match[1] + "px"
 }
 
+func ensureCategoryProtectionColumnsAdmin(db *sql.DB) {
+	for _, stmt := range []string{
+		`ALTER TABLE go_category_settings ADD COLUMN protected INTEGER DEFAULT 0`,
+		`ALTER TABLE go_category_settings ADD COLUMN password_hash TEXT DEFAULT ''`,
+	} {
+		if _, err := db.Exec(stmt); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
+			log.Printf("Error updating category settings table: %v", err)
+		}
+	}
+}
+
 func main() {
 	// Get executable path and change to its directory
 	exePath, err := os.Executable()
@@ -206,11 +218,14 @@ func main() {
 	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS go_category_settings (
 		mid INTEGER PRIMARY KEY,
 		show_on_home INTEGER DEFAULT 1,
-		is_offline INTEGER DEFAULT 0
+		is_offline INTEGER DEFAULT 0,
+		protected INTEGER DEFAULT 0,
+		password_hash TEXT DEFAULT ''
 	)`)
 	if err != nil {
 		log.Fatal("Failed to create category settings table:", err)
 	}
+	ensureCategoryProtectionColumnsAdmin(db)
 
 	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS go_cf_shield_logs (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1762,7 +1777,7 @@ func main() {
                                (SELECT COUNT(*) FROM typecho_relationships r 
                                 JOIN typecho_contents c ON r.cid = c.cid 
                                 WHERE r.mid = m.mid AND c.type='post' AND c.status='publish') as count, 
-                                 m."order", COALESCE(s.show_on_home, 1), COALESCE(s.is_offline, 0) 
+                                 m."order", COALESCE(s.show_on_home, 1), COALESCE(s.is_offline, 0), COALESCE(s.protected, 0), COALESCE(s.password_hash, '') 
                                  FROM typecho_metas m 
                                  LEFT JOIN go_category_settings s ON m.mid = s.mid 
                                  WHERE m.type='category' ORDER BY m."order" ASC, m.mid ASC LIMIT ? OFFSET ?`, pageSize, offset)
@@ -1774,9 +1789,9 @@ func main() {
 
 		var categories []map[string]interface{}
 		for rows.Next() {
-			var mid, count, order, showOnHome, isOffline int
-			var name, slug string
-			rows.Scan(&mid, &name, &slug, &count, &order, &showOnHome, &isOffline)
+			var mid, count, order, showOnHome, isOffline, protected int
+			var name, slug, passwordHash string
+			rows.Scan(&mid, &name, &slug, &count, &order, &showOnHome, &isOffline, &protected, &passwordHash)
 			categories = append(categories, map[string]interface{}{
 				"Mid":        mid,
 				"Name":       name,
@@ -1785,6 +1800,7 @@ func main() {
 				"Order":      order,
 				"ShowOnHome": showOnHome == 1,
 				"IsOffline":  isOffline == 1,
+				"Protected":  protected == 1 && strings.TrimSpace(passwordHash) != "",
 			})
 		}
 
@@ -1810,6 +1826,27 @@ func main() {
 		order := c.DefaultPostForm("order", "0")
 		showOnHome := c.DefaultPostForm("showOnHome", "0")
 		isOffline := c.DefaultPostForm("isOffline", "0")
+		protected := c.DefaultPostForm("protected", "0")
+		categoryPassword := strings.TrimSpace(c.PostForm("categoryPassword"))
+		passwordHash := ""
+		if categoryPassword != "" {
+			hashed, err := bcrypt.GenerateFromPassword([]byte(categoryPassword), bcrypt.DefaultCost)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"success": false, "message": "密码加密失败"})
+				return
+			}
+			passwordHash = string(hashed)
+		}
+		if protected == "1" && passwordHash == "" {
+			var existingHash string
+			if midStr != "" && midStr != "0" {
+				db.QueryRow("SELECT COALESCE(password_hash, '') FROM go_category_settings WHERE mid=?", midStr).Scan(&existingHash)
+			}
+			if strings.TrimSpace(existingHash) == "" {
+				c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "启用访问密码时必须填写密码"})
+				return
+			}
+		}
 
 		// Check if this is an AJAX request
 		isAjax := c.GetHeader("X-Requested-With") == "XMLHttpRequest" ||
@@ -1826,7 +1863,7 @@ func main() {
 				return
 			}
 			lastId, _ := res.LastInsertId()
-			db.Exec("INSERT INTO go_category_settings (mid, show_on_home, is_offline) VALUES (?, ?, ?)", lastId, showOnHome, isOffline)
+			db.Exec("INSERT INTO go_category_settings (mid, show_on_home, is_offline, protected, password_hash) VALUES (?, ?, ?, ?, ?)", lastId, showOnHome, isOffline, protected, passwordHash)
 		} else {
 			_, err := db.Exec("UPDATE typecho_metas SET name=?, slug=?, \"order\"=? WHERE mid=?", name, slug, order, midStr)
 			if err != nil {
@@ -1837,7 +1874,11 @@ func main() {
 				}
 				return
 			}
-			db.Exec("INSERT INTO go_category_settings (mid, show_on_home, is_offline) VALUES (?, ?, ?) ON CONFLICT(mid) DO UPDATE SET show_on_home=excluded.show_on_home, is_offline=excluded.is_offline", midStr, showOnHome, isOffline)
+			if passwordHash != "" {
+				db.Exec("INSERT INTO go_category_settings (mid, show_on_home, is_offline, protected, password_hash) VALUES (?, ?, ?, ?, ?) ON CONFLICT(mid) DO UPDATE SET show_on_home=excluded.show_on_home, is_offline=excluded.is_offline, protected=excluded.protected, password_hash=excluded.password_hash", midStr, showOnHome, isOffline, protected, passwordHash)
+			} else {
+				db.Exec("INSERT INTO go_category_settings (mid, show_on_home, is_offline, protected) VALUES (?, ?, ?, ?) ON CONFLICT(mid) DO UPDATE SET show_on_home=excluded.show_on_home, is_offline=excluded.is_offline, protected=excluded.protected", midStr, showOnHome, isOffline, protected)
+			}
 		}
 
 		if isAjax {

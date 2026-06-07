@@ -545,6 +545,7 @@
                         <th>名称</th>
                         <th>缩略名</th>
                         <th>首页显示</th>
+                        <th>访问密码</th>
                         <th>状态</th>
                         <th>文章数</th>
                         <th>操作</th>
@@ -565,6 +566,13 @@
                             {{end}}
                         </td>
                         <td>
+                            {{if .Protected}}
+                            <span style="color: #f59e0b;"><i class="fas fa-lock"></i> 已启用</span>
+                            {{else}}
+                            <span style="color: #6b7280;"><i class="fas fa-unlock"></i> 未启用</span>
+                            {{end}}
+                        </td>
+                        <td>
                             {{if .IsOffline}}
                             <span style="color: #ef4444;"><i class="fas fa-eye-slash"></i> 已下线</span>
                             {{else}}
@@ -577,6 +585,7 @@
                                 <button type="button" class="icon-action-btn" data-mid="{{.Mid}}" data-name="{{.Name}}" data-slug="{{.Slug}}"
                                     data-order="{{.Order}}" data-show="{{if .ShowOnHome}}1{{else}}0{{end}}"
                                     data-offline="{{if .IsOffline}}1{{else}}0{{end}}"
+                                    data-protected="{{if .Protected}}1{{else}}0{{end}}"
                                     onclick="editCategoryBtn(this)" title="编辑" aria-label="编辑">
                                     <i class="fas fa-pen"></i>
                                 </button>
@@ -650,6 +659,14 @@
                             <input type="checkbox" name="isOffline" id="modal-field-isOffline" value="1" style="width: auto;">
                             <label for="modal-field-isOffline" style="margin-bottom: 0; color: #ef4444;">下线该分类（全站隐藏并禁止访问）</label>
                         </div>
+                        <div class="form-group" style="display: flex; align-items: center; gap: 10px; margin-top: 5px;">
+                            <input type="checkbox" name="protected" id="modal-field-protected" value="1" style="width: auto;">
+                            <label for="modal-field-protected" style="margin-bottom: 0; color: #f59e0b;">启用访问密码</label>
+                        </div>
+                        <div class="form-group">
+                            <label>分类访问密码</label>
+                            <input type="password" name="categoryPassword" id="modal-field-categoryPassword" placeholder="留空表示不修改旧密码">
+                        </div>
                     </div>
                     <div class="modal-footer">
                         <button type="button" class="btn-cancel" onclick="closeModal()">取消</button>
@@ -669,6 +686,8 @@
             document.getElementById('modal-field-order').value = '0';
             document.getElementById('modal-field-showOnHome').checked = true;
             document.getElementById('modal-field-isOffline').checked = false;
+            document.getElementById('modal-field-protected').checked = false;
+            document.getElementById('modal-field-categoryPassword').value = '';
             document.getElementById('category-modal').classList.add('active');
         }
 
@@ -679,6 +698,7 @@
             const order = btn.getAttribute('data-order');
             const showOnHome = btn.getAttribute('data-show') === '1';
             const isOffline = btn.getAttribute('data-offline') === '1';
+            const isProtected = btn.getAttribute('data-protected') === '1';
 
             document.getElementById('modal-title').innerText = '编辑分类';
             document.getElementById('modal-field-mid').value = mid;
@@ -687,6 +707,8 @@
             document.getElementById('modal-field-order').value = order;
             document.getElementById('modal-field-showOnHome').checked = showOnHome;
             document.getElementById('modal-field-isOffline').checked = isOffline;
+            document.getElementById('modal-field-protected').checked = isProtected;
+            document.getElementById('modal-field-categoryPassword').value = '';
             document.getElementById('category-modal').classList.add('active');
         }
 
