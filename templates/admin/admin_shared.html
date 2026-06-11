@@ -31,6 +31,60 @@
 
     <a href="/blog" style="margin-top: auto;" target="_blank"><i class="fas fa-external-link-alt"></i> 访问前台</a>
 </div>
+{{template "admin_csrf_bootstrap" .}}
+{{end}}
+
+{{define "admin_csrf_bootstrap"}}
+<script>
+(function () {
+    function readCookie(name) {
+        var parts = document.cookie ? document.cookie.split('; ') : [];
+        for (var i = 0; i < parts.length; i++) {
+            var pair = parts[i].split('=');
+            if (decodeURIComponent(pair[0]) === name) {
+                return decodeURIComponent(pair.slice(1).join('='));
+            }
+        }
+        return '';
+    }
+    function csrfToken() {
+        return readCookie('te_csrf');
+    }
+    function injectForms() {
+        var token = csrfToken();
+        if (!token) {
+            return;
+        }
+        document.querySelectorAll('form').forEach(function (form) {
+            var method = (form.getAttribute('method') || 'GET').toUpperCase();
+            if (method !== 'POST' || form.querySelector('input[name="_csrf"]')) {
+                return;
+            }
+            var input = document.createElement('input');
+            input.type = 'hidden';
+            input.name = '_csrf';
+            input.value = token;
+            form.appendChild(input);
+        });
+    }
+    document.addEventListener('DOMContentLoaded', injectForms);
+
+    var nativeFetch = window.fetch;
+    window.fetch = function (input, init) {
+        init = init || {};
+        var method = (init.method || (input && input.method) || 'GET').toUpperCase();
+        if (!['GET', 'HEAD', 'OPTIONS'].includes(method)) {
+            var headers = new Headers(init.headers || (input && input.headers) || {});
+            var token = csrfToken();
+            if (token && !headers.has('X-CSRF-Token')) {
+                headers.set('X-CSRF-Token', token);
+            }
+            init.headers = headers;
+        }
+        return nativeFetch(input, init);
+    };
+})();
+</script>
 {{end}}
 
 {{define "admin_topbar"}}

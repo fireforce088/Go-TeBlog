@@ -63,7 +63,7 @@ fi
 # 编译后台
 if [ -f "$CUR_DIR/admin.go" ]; then
     echo "开始编译后台服务 (admin.go)..."
-    go build -o "$CUR_DIR/admin_app" "$CUR_DIR/admin.go" "$CUR_DIR/admin_helpers.go"
+    go build -o "$CUR_DIR/admin_app" "$CUR_DIR/admin.go" "$CUR_DIR/admin_helpers.go" "$CUR_DIR/admin_storage.go"
     echo "后台服务编译成功"
 elif [ -f "$CUR_DIR/admin_app" ]; then
     echo "未发现 admin.go，将使用现有的二进制文件 admin_app"
@@ -100,6 +100,11 @@ ExecStart=$exec_path
 Restart=always
 RestartSec=5
 Environment=GIN_MODE=release
+Environment=MINIO_ENDPOINT=${MINIO_ENDPOINT:-}
+Environment=MINIO_ACCESS_KEY=${MINIO_ACCESS_KEY:-}
+Environment=MINIO_SECRET_KEY=${MINIO_SECRET_KEY:-}
+Environment=MINIO_BUCKET=${MINIO_BUCKET:-blog-images}
+Environment=MINIO_PUBLIC_URL=${MINIO_PUBLIC_URL:-}
 
 [Install]
 WantedBy=multi-user.target
