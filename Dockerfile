@@ -9,11 +9,12 @@ RUN go mod download
 
 COPY . .
 RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/blog_app ./main.go
-RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/admin_app ./admin.go ./admin_helpers.go
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/admin_app ./admin.go ./admin_helpers.go ./admin_storage.go
 
 FROM alpine:3.22
 
-RUN apk add --no-cache bash ca-certificates tar tzdata
+RUN sed -i 's|dl-cdn.alpinelinux.org|mirrors.tuna.tsinghua.edu.cn|g' /etc/apk/repositories && \
+    apk add --no-cache bash ca-certificates curl sqlite tar tzdata
 
 WORKDIR /app
 
@@ -23,12 +24,13 @@ COPY templates /app/templates
 COPY usr /app/usr
 COPY static /app/static
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+COPY backup.sh /usr/local/bin/backup.sh
 
-RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh /usr/local/bin/backup.sh
 
 ENV TZ=Asia/Shanghai \
     INIT_ADMIN_USER=admin \
-    INIT_ADMIN_PASSWORD=admin
+    INIT_ADMIN_PASSWORD=
 
 VOLUME ["/data"]
 EXPOSE 8190 8191

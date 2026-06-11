@@ -1,6 +1,9 @@
 package main
 
 import (
+	"crypto/rand"
+	"crypto/subtle"
+	"encoding/base64"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -17,6 +20,7 @@ import (
 )
 
 const adminSessionCookieName = "te_auth"
+const adminCSRFCookieName = "te_csrf"
 
 type loginAttemptLimiter struct {
 	mu       sync.Mutex
@@ -95,14 +99,13 @@ func loginAttemptKey(ip, username string) string {
 }
 
 func setAdminSessionCookie(c *gin.Context, value string, maxAge int) {
-	secure := c.Request != nil && c.Request.TLS != nil
 	cookie := &http.Cookie{
 		Name:     adminSessionCookieName,
 		Value:    value,
 		Path:     "/",
 		MaxAge:   maxAge,
 		HttpOnly: true,
-		Secure:   secure,
+		Secure:   isSecureRequest(c),
 		SameSite: http.SameSiteLaxMode,
 	}
 	http.SetCookie(c.Writer, cookie)
@@ -110,6 +113,94 @@ func setAdminSessionCookie(c *gin.Context, value string, maxAge int) {
 
 func clearAdminSessionCookie(c *gin.Context) {
 	setAdminSessionCookie(c, "", -1)
+}
+
+func isSecureRequest(c *gin.Context) bool {
+	if c == nil || c.Request == nil {
+		return false
+	}
+	if c.Request.TLS != nil {
+		return true
+	}
+	forwardedProto := strings.ToLower(strings.TrimSpace(strings.Split(c.GetHeader("X-Forwarded-Proto"), ",")[0]))
+	return forwardedProto == "https" || strings.EqualFold(c.GetHeader("X-Forwarded-Ssl"), "on")
+}
+
+func newAdminCSRFToken() string {
+	var b [32]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return base64.RawURLEncoding.EncodeToString([]byte(fmt.Sprintf("%d", time.Now().UnixNano())))
+	}
+	return base64.RawURLEncoding.EncodeToString(b[:])
+}
+
+func setAdminCSRFCookie(c *gin.Context, token string) {
+	http.SetCookie(c.Writer, &http.Cookie{
+		Name:     adminCSRFCookieName,
+		Value:    token,
+		Path:     "/",
+		MaxAge:   int((12 * time.Hour).Seconds()),
+		HttpOnly: false,
+		Secure:   isSecureRequest(c),
+		SameSite: http.SameSiteLaxMode,
+	})
+}
+
+func ensureAdminCSRFToken(c *gin.Context) string {
+	token, err := c.Cookie(adminCSRFCookieName)
+	if err != nil || strings.TrimSpace(token) == "" {
+		token = newAdminCSRFToken()
+	}
+	setAdminCSRFCookie(c, token)
+	return token
+}
+
+func requestCSRFToken(c *gin.Context) string {
+	token := strings.TrimSpace(c.GetHeader("X-CSRF-Token"))
+	if token != "" {
+		return token
+	}
+	return strings.TrimSpace(c.PostForm("_csrf"))
+}
+
+func validateAdminCSRFToken(c *gin.Context) bool {
+	cookieToken, err := c.Cookie(adminCSRFCookieName)
+	if err != nil {
+		return false
+	}
+	submittedToken := requestCSRFToken(c)
+	if strings.TrimSpace(cookieToken) == "" || submittedToken == "" {
+		return false
+	}
+	if len(cookieToken) != len(submittedToken) {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(cookieToken), []byte(submittedToken)) == 1
+}
+
+func adminCSRFMiddleware(adminPath string) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		ensureAdminCSRFToken(c)
+		switch c.Request.Method {
+		case http.MethodGet, http.MethodHead, http.MethodOptions:
+			c.Next()
+			return
+		}
+		if validateAdminCSRFToken(c) {
+			c.Next()
+			return
+		}
+		if c.GetHeader("X-Requested-With") == "XMLHttpRequest" || strings.Contains(c.GetHeader("Accept"), "application/json") {
+			c.JSON(http.StatusForbidden, gin.H{"success": false, "message": "CSRF token invalid"})
+		} else {
+			c.HTML(http.StatusForbidden, "admin_error.html", gin.H{
+				"AdminPath":    adminPath,
+				"ErrorTitle":   "请求已拒绝",
+				"ErrorMessage": "安全令牌无效或已过期，请刷新页面后重试。",
+			})
+		}
+		c.Abort()
+	}
 }
 
 type adminPostFilter struct {

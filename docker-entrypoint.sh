@@ -3,7 +3,9 @@ set -euo pipefail
 
 DATA_DIR="${DATA_DIR:-/data}"
 INIT_ADMIN_USER="${INIT_ADMIN_USER:-admin}"
-INIT_ADMIN_PASSWORD="${INIT_ADMIN_PASSWORD:-admin}"
+INIT_ADMIN_PASSWORD="${INIT_ADMIN_PASSWORD:-}"
+RESET_ADMIN_USER="${RESET_ADMIN_USER:-$INIT_ADMIN_USER}"
+RESET_ADMIN_PASSWORD="${RESET_ADMIN_PASSWORD:-}"
 
 mkdir -p "$DATA_DIR/uploads" "$DATA_DIR/backups"
 
@@ -23,7 +25,11 @@ if [ ! -e /app/blog.sqlite ]; then
 fi
 
 if [ ! -f "$DATA_DIR/blog.sqlite" ] && [ -n "$INIT_ADMIN_PASSWORD" ]; then
-  /app/admin_app --init-user="$INIT_ADMIN_USER" --init-pass="$INIT_ADMIN_PASSWORD"
+  /app/admin_app --db="$DATA_DIR/blog.sqlite" --init-user="$INIT_ADMIN_USER" --init-pass="$INIT_ADMIN_PASSWORD"
+fi
+
+if [ -n "$RESET_ADMIN_PASSWORD" ]; then
+  /app/admin_app --db="$DATA_DIR/blog.sqlite" --reset-password --reset-user="$RESET_ADMIN_USER" --reset-pass="$RESET_ADMIN_PASSWORD"
 fi
 
 shutdown() {
@@ -38,10 +44,10 @@ shutdown() {
 
 trap shutdown INT TERM
 
-/app/admin_app &
+/app/admin_app --db="$DATA_DIR/blog.sqlite" &
 ADMIN_PID="$!"
 
-/app/blog_app &
+/app/blog_app --db="$DATA_DIR/blog.sqlite" &
 BLOG_PID="$!"
 
 wait -n "$ADMIN_PID" "$BLOG_PID"

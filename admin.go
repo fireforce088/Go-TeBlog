@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"crypto/md5"
+	"crypto/rand"
 	"database/sql"
 	"encoding/json"
 	"flag"
@@ -10,6 +11,7 @@ import (
 	"html/template"
 	"io"
 	"log"
+	"math/big"
 	"net/http"
 	"os"
 	"os/exec"
@@ -141,6 +143,86 @@ func ensureCategoryProtectionColumnsAdmin(db *sql.DB) {
 	}
 }
 
+func ensureAdminUsersTable(db *sql.DB) error {
+	_, err := db.Exec(`CREATE TABLE IF NOT EXISTS "typecho_users" (
+		"uid" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+		"name" VARCHAR(32) UNIQUE,
+		"password" VARCHAR(64),
+		"mail" VARCHAR(150) UNIQUE,
+		"url" VARCHAR(150),
+		"screenName" VARCHAR(32),
+		"created" INTEGER DEFAULT 0,
+		"activated" INTEGER DEFAULT 0,
+		"logged" INTEGER DEFAULT 0,
+		"group" VARCHAR(16) DEFAULT 'visitor',
+		"authCode" VARCHAR(64)
+	)`)
+	return err
+}
+
+const generatedPasswordAlphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+
+func generateAdminPassword(length int) (string, error) {
+	if length <= 0 {
+		return "", fmt.Errorf("password length must be positive")
+	}
+	var builder strings.Builder
+	builder.Grow(length)
+	max := big.NewInt(int64(len(generatedPasswordAlphabet)))
+	for i := 0; i < length; i++ {
+		n, err := rand.Int(rand.Reader, max)
+		if err != nil {
+			return "", err
+		}
+		builder.WriteByte(generatedPasswordAlphabet[n.Int64()])
+	}
+	return builder.String(), nil
+}
+
+func upsertAdminUser(db *sql.DB, username, password string) error {
+	username = strings.TrimSpace(username)
+	if username == "" {
+		username = "admin"
+	}
+	hash, err := hashAdminPassword(password)
+	if err != nil {
+		return err
+	}
+	now := time.Now().Unix()
+	_, err = db.Exec(`INSERT INTO typecho_users (name, password, mail, screenName, "group", created, activated, logged)
+		VALUES (?, ?, ?, ?, 'administrator', ?, ?, ?)
+		ON CONFLICT(name) DO UPDATE SET
+			password=excluded.password,
+			"group"='administrator',
+			activated=excluded.activated`,
+		username, hash, username+"@example.com", "Administrator", now, now, now)
+	return err
+}
+
+func ensureInitialAdminUser(db *sql.DB) error {
+	var count int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM typecho_users WHERE COALESCE("group", '') = 'administrator'`).Scan(&count); err != nil {
+		return err
+	}
+	if count > 0 {
+		return nil
+	}
+	password, err := generateAdminPassword(8)
+	if err != nil {
+		return err
+	}
+	if err := upsertAdminUser(db, "admin", password); err != nil {
+		return err
+	}
+	log.Println("====================================================")
+	log.Println("首次启动已创建后台管理员账号")
+	log.Println("后台用户名: admin")
+	log.Printf("后台密码: %s\n", password)
+	log.Println("请登录后立即修改密码。")
+	log.Println("====================================================")
+	return nil
+}
+
 func main() {
 	// Get executable path and change to its directory
 	exePath, err := os.Executable()
@@ -152,46 +234,54 @@ func main() {
 		log.Fatal(err)
 	}
 
-	db, err := sql.Open("sqlite", "./blog.sqlite")
+	// Define command line flags for initialization
+	dbPath := flag.String("db", "./blog.sqlite", "Database file path")
+	initUser := flag.String("init-user", "", "Initial admin username")
+	initPass := flag.String("init-pass", "", "Initial admin password")
+	resetPassword := flag.Bool("reset-password", false, "Reset an admin user's password")
+	resetUser := flag.String("reset-user", "admin", "Admin username to reset")
+	resetPass := flag.String("reset-pass", "", "New admin password; random 8-character password is generated when empty")
+	addr := flag.String("addr", "127.0.0.1:8191", "listen address")
+	flag.Parse()
+
+	db, err := sql.Open("sqlite", *dbPath)
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer db.Close()
 
-	// Define command line flags for initialization
-	initUser := flag.String("init-user", "", "Initial admin username")
-	initPass := flag.String("init-pass", "", "Initial admin password")
-	flag.Parse()
+	// Initialize MinIO connection (非阻塞，失败则回退本地存储)
+	InitMinIO()
+
+	if err := ensureAdminUsersTable(db); err != nil {
+		log.Fatal("Failed to create users table:", err)
+	}
 
 	// Handle standalone initialization if flags are provided
 	if *initUser != "" && *initPass != "" {
-		// Ensure typecho_users table exists
-		_, err = db.Exec(`CREATE TABLE IF NOT EXISTS "typecho_users" (
-			"uid" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
-			"name" VARCHAR(32) UNIQUE,
-			"password" VARCHAR(64),
-			"mail" VARCHAR(150) UNIQUE,
-			"url" VARCHAR(150),
-			"screenName" VARCHAR(32),
-			"created" INTEGER DEFAULT 0,
-			"activated" INTEGER DEFAULT 0,
-			"logged" INTEGER DEFAULT 0,
-			"group" VARCHAR(16) DEFAULT 'visitor',
-			"authCode" VARCHAR(64)
-		)`)
-		if err != nil {
-			log.Fatal("Failed to create users table for initialization:", err)
-		}
-
-		now := time.Now().Unix()
-		hash := hashTypecho(*initPass)
-		_, err = db.Exec(`INSERT OR IGNORE INTO typecho_users (name, password, mail, screenName, "group", created, activated, logged) 
-			VALUES (?, ?, ?, ?, 'administrator', ?, ?, ?)`,
-			*initUser, hash, *initUser+"@example.com", "Administrator", now, now, now)
-		if err != nil {
+		if err := upsertAdminUser(db, *initUser, *initPass); err != nil {
 			log.Fatal("Failed to initialize admin user:", err)
 		}
 		log.Printf("Admin user '%s' initialized successfully.\n", *initUser)
+		return
+	}
+
+	if *resetPassword {
+		password := *resetPass
+		if strings.TrimSpace(password) == "" {
+			password, err = generateAdminPassword(8)
+			if err != nil {
+				log.Fatal("Failed to generate admin password:", err)
+			}
+		}
+		if err := upsertAdminUser(db, *resetUser, password); err != nil {
+			log.Fatal("Failed to reset admin password:", err)
+		}
+		_, _ = db.Exec("DELETE FROM go_sessions WHERE username = ?", strings.TrimSpace(*resetUser))
+		log.Println("====================================================")
+		log.Printf("后台用户 '%s' 的密码已重置。\n", strings.TrimSpace(*resetUser))
+		log.Printf("后台密码: %s\n", password)
+		log.Println("====================================================")
 		return
 	}
 
@@ -246,6 +336,10 @@ func main() {
 	_, err = db.Exec(`CREATE INDEX IF NOT EXISTS idx_cf_shield_logs_created ON go_cf_shield_logs (created)`)
 	if err != nil {
 		log.Fatal("Failed to create Cloudflare shield logs index:", err)
+	}
+
+	if err := ensureInitialAdminUser(db); err != nil {
+		log.Fatal("Failed to ensure initial admin user:", err)
 	}
 
 	applyConfiguredTimezone(db)
@@ -346,7 +440,6 @@ func main() {
 		db.Exec("UPDATE go_sessions SET created_at = ? WHERE session_id = ?", time.Now().Unix(), sessionID)
 		setAdminSessionCookie(c, sessionID, int(timeout))
 
-		// Fetch user group
 		var userGroup string
 		db.QueryRow("SELECT COALESCE(\"group\", 'visitor') FROM typecho_users WHERE name = ?", username).Scan(&userGroup)
 
@@ -381,10 +474,21 @@ func main() {
 	}
 
 	r.GET(adminPath+"/login", func(c *gin.Context) {
+		ensureAdminCSRFToken(c)
 		c.HTML(http.StatusOK, "admin_login.html", gin.H{"AdminPath": adminPath})
 	})
 
 	r.POST(adminPath+"/login", func(c *gin.Context) {
+		ensureAdminCSRFToken(c)
+		if !validateAdminCSRFToken(c) {
+			c.HTML(http.StatusForbidden, "admin_error.html", gin.H{
+				"AdminPath":    adminPath,
+				"ErrorTitle":   "请求已拒绝",
+				"ErrorMessage": "安全令牌无效或已过期，请刷新登录页后重试。",
+			})
+			return
+		}
+
 		username := strings.TrimSpace(c.PostForm("username"))
 		password := c.PostForm("password")
 		attemptKey := loginAttemptKey(c.ClientIP(), username)
@@ -402,13 +506,17 @@ func main() {
 
 		if err == nil && checkTypechoHash(password, storedHash) {
 			loginLimiter.RecordSuccess(attemptKey)
+			if needsPasswordRehash(storedHash) {
+				if newHash, hashErr := hashAdminPassword(password); hashErr == nil {
+					db.Exec("UPDATE typecho_users SET password=? WHERE name=?", newHash, username)
+				} else {
+					log.Printf("Failed to rehash password for %s: %v", username, hashErr)
+				}
+			}
 			timeout := getOptionInt(db, "sessionTimeout", 30) * 60
-			// Cleanup old sessions
 			db.Exec("DELETE FROM go_sessions WHERE created_at < ?", time.Now().Unix()-int64(timeout))
-			// 单点登录：清理该账号已有会话，确保新登录踢出旧登录
 			db.Exec("DELETE FROM go_sessions WHERE username = ?", username)
 
-			// 更新最后登录时间
 			db.Exec("UPDATE typecho_users SET logged = ? WHERE name = ?", time.Now().Unix(), username)
 
 			sessionID := uuid.New().String()
@@ -439,6 +547,7 @@ func main() {
 	})
 
 	admin := r.Group(adminPath, authMiddleware)
+	admin.Use(adminCSRFMiddleware(adminPath))
 
 	attachmentPathRe := regexp.MustCompile(`"path"\s*:\s*"([^"]+)"`)
 	resolveAttachmentPath := func(title, text string) string {
@@ -790,7 +899,16 @@ func main() {
 			return
 		}
 
-		newHash := hashTypecho(newPassword)
+		newHash, err := hashAdminPassword(newPassword)
+		if err != nil {
+			c.HTML(http.StatusOK, "admin_profile.html", gin.H{
+				"Username":     username,
+				"Tab":          "profile",
+				"AdminPath":    adminPath,
+				"ErrorMessage": "生成新密码哈希失败",
+			})
+			return
+		}
 		_, err = db.Exec("UPDATE typecho_users SET password=? WHERE name=?", newHash, username)
 		if err != nil {
 			c.HTML(http.StatusOK, "admin_profile.html", gin.H{
@@ -2024,9 +2142,18 @@ func main() {
 			return
 		}
 
-		hash := hashTypecho(password)
+		hash, err := hashAdminPassword(password)
+		if err != nil {
+			c.HTML(http.StatusOK, "admin_user_edit.html", gin.H{
+				"Username":     username,
+				"User":         map[string]interface{}{},
+				"AdminPath":    adminPath,
+				"ErrorMessage": "生成密码哈希失败",
+			})
+			return
+		}
 		now := time.Now().Unix()
-		_, err := db.Exec(`INSERT INTO typecho_users (name, password, mail, url, screenName, created, activated, logged, "group") 
+		_, err = db.Exec(`INSERT INTO typecho_users (name, password, mail, url, screenName, created, activated, logged, "group")
 			VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)`,
 			name, hash, mail, url, screenName, now, now, group)
 
@@ -2099,7 +2226,11 @@ func main() {
 		group := c.PostForm("group")
 
 		if password != "" {
-			hash := hashTypecho(password)
+			hash, hashErr := hashAdminPassword(password)
+			if hashErr != nil {
+				c.String(500, hashErr.Error())
+				return
+			}
 			_, err := db.Exec("UPDATE typecho_users SET screenName=?, mail=?, password=?, url=?, \"group\"=? WHERE uid=?",
 				screenName, mail, hash, url, group, uid)
 			if err != nil {
@@ -2635,18 +2766,27 @@ func main() {
 				relPath, fileName, now.Unix(), now.Unix(), "", parentCid)
 		}
 
+		// 同步上传到 MinIO 图床（失败不中断，回退本地路径）
+		finalURL := relPath
+		if minioURL := uploadToMinIO(absPath, relPath); minioURL != "" {
+			finalURL = minioURL
+		}
+
 		c.JSON(http.StatusOK, gin.H{
 			"success": 1,
 			"message": "上传成功",
-			"url":     relPath,
+			"url":     finalURL,
 		})
 	})
 
 	log.Println("Admin Server starting on 0.0.0.0:8191")
-	r.Run("0.0.0.0:8191")
+	r.Run(*addr)
 }
 
 func checkTypechoHash(password, hash string) bool {
+	if isBcryptHash(hash) {
+		return bcrypt.CompareHashAndPassword([]byte(hash), []byte(password)) == nil
+	}
 	return cryptPrivate(password, hash) == hash
 }
 
@@ -2683,10 +2823,24 @@ func encode64(input []byte, count int) string {
 	return res
 }
 
-func hashTypecho(password string) string {
-	salt := uuid.New().String()[:8]
-	setting := "$P$" + string(itoa64[8]) + salt
-	return cryptPrivate(password, setting)
+func hashAdminPassword(password string) (string, error) {
+	hashed, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	if err != nil {
+		return "", err
+	}
+	return string(hashed), nil
+}
+
+func isBcryptHash(hash string) bool {
+	return strings.HasPrefix(hash, "$2a$") || strings.HasPrefix(hash, "$2b$") || strings.HasPrefix(hash, "$2y$")
+}
+
+func needsPasswordRehash(hash string) bool {
+	if !isBcryptHash(hash) {
+		return true
+	}
+	cost, err := bcrypt.Cost([]byte(hash))
+	return err != nil || cost < bcrypt.DefaultCost
 }
 
 func applyConfiguredTimezone(db *sql.DB) {
@@ -3208,6 +3362,9 @@ func isCloudflareRequest(c *gin.Context) bool {
 }
 
 func cryptPrivate(password string, setting string) string {
+	if len(setting) < 12 {
+		return "*"
+	}
 	if !strings.HasPrefix(setting, "$P$") && !strings.HasPrefix(setting, "$H$") {
 		return "*"
 	}
