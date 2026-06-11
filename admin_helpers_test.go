@@ -3,6 +3,7 @@ package main
 import (
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -33,6 +34,55 @@ func TestSetAdminSessionCookieUsesSaferDefaults(t *testing.T) {
 	}
 }
 
+func TestSetAdminSessionCookieTrustsForwardedProto(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "http://example.com/admin", nil)
+	ctx.Request.Header.Set("X-Forwarded-Proto", "https")
+
+	setAdminSessionCookie(ctx, "session-123", 1800)
+
+	cookie := recorder.Result().Cookies()[0]
+	if !cookie.Secure {
+		t.Fatal("expected Secure cookie behind HTTPS reverse proxy")
+	}
+}
+
+func TestAdminCSRFValidationRequiresMatchingCookieAndToken(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	ctx := func(token string) *gin.Context {
+		recorder := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(recorder)
+		c.Request = httptest.NewRequest(http.MethodPost, "https://example.com/admin/save", strings.NewReader("_csrf="+token))
+		c.Request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		c.Request.AddCookie(&http.Cookie{Name: adminCSRFCookieName, Value: "token-123"})
+		return c
+	}
+
+	if !validateAdminCSRFToken(ctx("token-123")) {
+		t.Fatal("expected matching CSRF cookie and form token to validate")
+	}
+
+	if validateAdminCSRFToken(ctx("wrong")) {
+		t.Fatal("expected mismatched CSRF token to fail")
+	}
+}
+
+func TestAdminCSRFValidationAcceptsHeaderToken(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "https://example.com/admin/save", strings.NewReader("_csrf=token-123"))
+	ctx.Request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	ctx.Request.Header.Set("X-CSRF-Token", "token-123")
+	ctx.Request.AddCookie(&http.Cookie{Name: adminCSRFCookieName, Value: "token-123"})
+
+	if !validateAdminCSRFToken(ctx) {
+		t.Fatal("expected matching CSRF cookie and header token to validate")
+	}
+}
+
 func TestLoginAttemptLimiterLocksAfterRepeatedFailures(t *testing.T) {
 	limiter := newLoginAttemptLimiter(3, time.Minute, 5*time.Minute)
 	now := time.Unix(1000, 0)
@@ -58,6 +108,16 @@ func TestLoginAttemptLimiterLocksAfterRepeatedFailures(t *testing.T) {
 	allowed, _ = limiter.Allow(key, now.Add(5*time.Second))
 	if !allowed {
 		t.Fatal("expected successful login to reset limiter")
+	}
+}
+
+func TestGenerateAdminPasswordUsesEightAlphanumericCharacters(t *testing.T) {
+	password, err := generateAdminPassword(8)
+	if err != nil {
+		t.Fatalf("generateAdminPassword failed: %v", err)
+	}
+	if !regexp.MustCompile(`^[A-Za-z0-9]{8}$`).MatchString(password) {
+		t.Fatalf("unexpected generated password: %q", password)
 	}
 }
 
