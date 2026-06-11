@@ -2,13 +2,16 @@ package main
 
 import (
 	"bytes"
+	"crypto/rand"
 	"database/sql"
 	"encoding/json"
 	"encoding/xml"
+	"flag"
 	"fmt"
 	"html/template"
 	"io"
 	"log"
+	"math/big"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -56,6 +59,8 @@ var commentLimiter = &commentAttemptLimiter{
 	byIP:     make(map[string][]int64),
 	lastSeen: make(map[string]int64),
 }
+
+const generatedPasswordAlphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 
 type cloudflareShieldManager struct {
 	db *sql.DB
@@ -981,6 +986,13 @@ func handleBeacon(c *gin.Context) {
 	c.Status(http.StatusNoContent)
 }
 
+// unwrapHTMLImages 在 goldmark.Convert 之前，
+// 把 <p align="center">![alt](url)</p> 这种 HTML 包裹的 Markdown 图片解包成纯 Markdown 格式
+func unwrapHTMLImages(content string) string {
+	re := regexp.MustCompile(`<p\s+align="center">(\s*!\[[^\]]*\]\([^)]+\))\s*</p>`)
+	return re.ReplaceAllString(content, "$1")
+}
+
 // fixAttachmentLinks 将 HTML 内容中的绝对路径附件/图片链接转换为相对路径
 // 这是一个为 Typecho 移植而设计的容错措施
 func fixAttachmentLinks(htmlContent string) string {
@@ -994,29 +1006,65 @@ func fixAttachmentLinks(htmlContent string) string {
 		path := sub[2]
 
 		// 转换逻辑：
-		// 1. 如果路径以 /usr/ 开头（Typecho 默认附件路径）
-		// 2. 如果文件是常见的图片格式，支持迁移后的各种路径
+		// 如果路径以 /usr/ 开头（Typecho 默认附件路径），转为相对路径
 
-		// 分离路径和查询参数以进行后缀检查
-		purePath := path
-		if idx := strings.Index(path, "?"); idx != -1 {
-			purePath = path[:idx]
+		// 跳过 img.w-tx.top 域名 — 该 MinIO 仍在运行，保持绝对 URL
+		if strings.Contains(strings.ToLower(match), "img.w-tx.top") {
+			return match
 		}
 
-		lowerPath := strings.ToLower(purePath)
-		isImg := strings.HasSuffix(lowerPath, ".jpg") ||
-			strings.HasSuffix(lowerPath, ".jpeg") ||
-			strings.HasSuffix(lowerPath, ".png") ||
-			strings.HasSuffix(lowerPath, ".gif") ||
-			strings.HasSuffix(lowerPath, ".webp") ||
-			strings.HasSuffix(lowerPath, ".svg")
-
-		if strings.HasPrefix(path, "/usr/") || isImg {
+		if strings.HasPrefix(path, "/usr/") {
 			return fmt.Sprintf("%s=\"%s\"", attr, path)
 		}
 
 		return match
 	})
+}
+
+func generateAdminPassword(length int) (string, error) {
+	if length <= 0 {
+		return "", fmt.Errorf("password length must be positive")
+	}
+	var builder strings.Builder
+	builder.Grow(length)
+	max := big.NewInt(int64(len(generatedPasswordAlphabet)))
+	for i := 0; i < length; i++ {
+		n, err := rand.Int(rand.Reader, max)
+		if err != nil {
+			return "", err
+		}
+		builder.WriteByte(generatedPasswordAlphabet[n.Int64()])
+	}
+	return builder.String(), nil
+}
+
+func hashAdminPassword(password string) (string, error) {
+	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	if err != nil {
+		return "", err
+	}
+	return string(hash), nil
+}
+
+func upsertAdminUser(db *sql.DB, username, password string) error {
+	username = strings.TrimSpace(username)
+	if username == "" {
+		username = "admin"
+	}
+	hash, err := hashAdminPassword(password)
+	if err != nil {
+		return err
+	}
+	now := time.Now().Unix()
+	_, err = db.Exec(`INSERT INTO typecho_users (name, password, mail, screenName, "group", created, activated, logged)
+		VALUES (?, ?, ?, ?, 'administrator', ?, ?, ?)
+		ON CONFLICT(name) DO UPDATE SET
+			password=excluded.password,
+			"group"='administrator',
+			activated=excluded.activated,
+			logged=excluded.logged`,
+		username, hash, username+"@example.com", "Administrator", now, now, now)
+	return err
 }
 
 func main() {
@@ -1030,7 +1078,15 @@ func main() {
 		log.Fatal(err)
 	}
 
-	db, err := sql.Open("sqlite", "./blog.sqlite")
+	dbPath := flag.String("db", "./blog.sqlite", "Database file path")
+	initUser := flag.String("init-user", "", "Initial admin username")
+	initPass := flag.String("init-pass", "", "Initial admin password")
+	resetPassword := flag.Bool("reset-password", false, "Reset an admin user's password")
+	resetUser := flag.String("reset-user", "admin", "Admin username to reset")
+	resetPass := flag.String("reset-pass", "", "New admin password; random 8-character password is generated when empty")
+	flag.Parse()
+
+	db, err := sql.Open("sqlite", *dbPath)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -1038,6 +1094,34 @@ func main() {
 
 	// Initialize database schema
 	initDB(db)
+
+	if *initUser != "" && *initPass != "" {
+		if err := upsertAdminUser(db, *initUser, *initPass); err != nil {
+			log.Fatal("Failed to initialize admin user:", err)
+		}
+		log.Printf("Admin user '%s' initialized successfully.\n", *initUser)
+		return
+	}
+
+	if *resetPassword {
+		password := *resetPass
+		if strings.TrimSpace(password) == "" {
+			password, err = generateAdminPassword(8)
+			if err != nil {
+				log.Fatal("Failed to generate admin password:", err)
+			}
+		}
+		if err := upsertAdminUser(db, *resetUser, password); err != nil {
+			log.Fatal("Failed to reset admin password:", err)
+		}
+		_, _ = db.Exec("DELETE FROM go_sessions WHERE username = ?", strings.TrimSpace(*resetUser))
+		log.Println("====================================================")
+		log.Printf("后台用户 '%s' 的密码已重置。\n", strings.TrimSpace(*resetUser))
+		log.Printf("后台密码: %s\n", password)
+		log.Println("====================================================")
+		return
+	}
+
 	applyConfiguredTimezone(db)
 
 	// 配置统计缓存队列大小
@@ -1088,7 +1172,6 @@ func main() {
 		goldmark.WithExtensions(extension.Linkify),
 		goldmark.WithRendererOptions(
 			html.WithHardWraps(),
-			html.WithUnsafe(),
 		),
 	)
 
@@ -1197,6 +1280,7 @@ func main() {
 		},
 		"fullContent": func(p Post) template.HTML {
 			content := strings.TrimPrefix(p.Text, "<!--markdown-->")
+			content = unwrapHTMLImages(content)
 			parts := strings.Split(content, "<!--more-->")
 			excerpt := parts[0]
 
@@ -1217,6 +1301,8 @@ func main() {
 		},
 		"renderMarkdown": func(text string) template.HTML {
 			content := strings.TrimPrefix(text, "<!--markdown-->")
+			content = strings.ReplaceAll(content, "<!--more-->", "")
+			content = unwrapHTMLImages(content)
 			var buf bytes.Buffer
 			if err := mdRenderer.Convert([]byte(content), &buf); err != nil {
 				return template.HTML(content)
