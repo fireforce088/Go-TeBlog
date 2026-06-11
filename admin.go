@@ -2480,6 +2480,7 @@ func main() {
 			group, _ := c.Get("userGroup")
 
 			post.Text = strings.TrimPrefix(post.Text, "<!--markdown-->")
+			post.Text = normalizeEditorMarkdown(post.Text)
 
 			// Fetch post's categories
 			postCats := make(map[int]bool)

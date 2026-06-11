@@ -1006,12 +1006,8 @@ func fixAttachmentLinks(htmlContent string) string {
 		path := sub[2]
 
 		// 转换逻辑：
-		// 如果路径以 /usr/ 开头（Typecho 默认附件路径），转为相对路径
-
-		// 跳过 img.w-tx.top 域名 — 该 MinIO 仍在运行，保持绝对 URL
-		if strings.Contains(strings.ToLower(match), "img.w-tx.top") {
-			return match
-		}
+		// 仅当路径以 /usr/ 开头（Typecho 默认附件路径），转为相对路径
+		// 所有 http:// 和 https:// 外链保持原样不变
 
 		if strings.HasPrefix(path, "/usr/") {
 			return fmt.Sprintf("%s=\"%s\"", attr, path)
