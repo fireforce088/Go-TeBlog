@@ -8,7 +8,13 @@ services:
       - "8190:8190"
     environment:
       TZ: Asia/Shanghai
+      GIN_MODE: release
       INIT_ADMIN_USER: admin
       INIT_ADMIN_PASSWORD: admin
+      MINIO_ENDPOINT: ${MINIO_ENDPOINT:-}
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-}
+      MINIO_BUCKET: ${MINIO_BUCKET:-blog-images}
+      MINIO_PUBLIC_URL: ${MINIO_PUBLIC_URL:-}
     volumes:
       - ./data:/data
