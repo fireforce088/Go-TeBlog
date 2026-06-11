@@ -60,3 +60,12 @@ static/robots.txt
 **/.codex
 .deploy/
 AGENTS.md
+
+# Build artifacts
+admin_app_new
+blog_app_new
+*.bak
+# Deployment logs
+deploy-logs/
+# Local database
+data/
