@@ -69,3 +69,6 @@ blog_app_new
 deploy-logs/
 # Local database
 data/
+
+# Local symlinks
+usr/uploads

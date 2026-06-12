@@ -993,6 +993,17 @@ func unwrapHTMLImages(content string) string {
 	return re.ReplaceAllString(content, "$1")
 }
 
+// protectLatexUnderscores 在 goldmark.Convert 之前，
+// 把 $...$ 和 $$...$$ 内部的 _ 转义为 \_，
+// 防止 Goldmark 把 LaTeX 下标符号解析为 Markdown 强调标记
+func protectLatexUnderscores(content string) string {
+	// Match: $$...$$ (display math) or $...$ (inline math)
+	re := regexp.MustCompile(`\$\$[^$]+\$\$|\$[^$]+\$`)
+	return re.ReplaceAllStringFunc(content, func(match string) string {
+		return strings.ReplaceAll(match, "_", "\\_")
+	})
+}
+
 // fixAttachmentLinks 将 HTML 内容中的绝对路径附件/图片链接转换为相对路径
 // 这是一个为 Typecho 移植而设计的容错措施
 func fixAttachmentLinks(htmlContent string) string {
@@ -1163,9 +1174,12 @@ func main() {
 	r.Any(adminPath, handleProxy)
 	r.Any(adminPath+"/*any", handleProxy)
 
-	// Configure Markdown renderer
+	// Configure Markdown renderer with GFM tables
 	mdRenderer := goldmark.New(
-		goldmark.WithExtensions(extension.Linkify),
+		goldmark.WithExtensions(
+			extension.Linkify,
+			extension.Table,
+		),
 		goldmark.WithRendererOptions(
 			html.WithHardWraps(),
 		),
@@ -1277,6 +1291,7 @@ func main() {
 		"fullContent": func(p Post) template.HTML {
 			content := strings.TrimPrefix(p.Text, "<!--markdown-->")
 			content = unwrapHTMLImages(content)
+			content = protectLatexUnderscores(content)
 			parts := strings.Split(content, "<!--more-->")
 			excerpt := parts[0]
 
@@ -1299,6 +1314,7 @@ func main() {
 			content := strings.TrimPrefix(text, "<!--markdown-->")
 			content = strings.ReplaceAll(content, "<!--more-->", "")
 			content = unwrapHTMLImages(content)
+			content = protectLatexUnderscores(content)
 			var buf bytes.Buffer
 			if err := mdRenderer.Convert([]byte(content), &buf); err != nil {
 				return template.HTML(content)

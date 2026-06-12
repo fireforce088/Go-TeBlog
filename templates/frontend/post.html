@@ -29,7 +29,15 @@
     <link rel="stylesheet" href="{{.Site.ThemeBase}}/style.css">
     <link rel="stylesheet" href="{{.Site.ThemeBase}}/go-custom.css">
     <link rel="stylesheet" href="{{.Site.ThemeBase}}/css/font-awesome.min.css">
+    <!-- KaTeX for math formula rendering -->
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.21/dist/katex.min.css" crossorigin="anonymous">
     <style>
+        .katex-display {
+            overflow-x: auto;
+            overflow-y: hidden;
+            padding: 0.5em 0;
+        }
+    </style>
         :root,
         :root[data-theme='dark'] {
             --primary-color: {{.Site.Skin.PrimaryColor}};
@@ -294,6 +302,17 @@
     <script src="{{.Site.ThemeBase}}/js/mobile-nav.js"></script>
     <script src="{{.Site.ThemeBase}}/js/theme-mode.js"></script>
     {{.Site.FooterCode}}
+    <!-- KaTeX for math formula rendering -->
+    <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.21/dist/katex.min.js" crossorigin="anonymous"></script>
+    <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.21/dist/contrib/auto-render.min.js" crossorigin="anonymous"
+        onload="renderMathInElement(document.body, {
+            delimiters: [
+                {left: '$$', right: '$$', display: true},
+                {left: '$', right: '$', display: false}
+            ],
+            throwOnError: false
+        });">
+    </script>
 </body>
 
 {{define "comment-node"}}
