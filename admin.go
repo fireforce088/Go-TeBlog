@@ -1366,8 +1366,9 @@ func main() {
 	admin.GET("/posts", func(c *gin.Context) {
 		pageStr := c.DefaultQuery("page", "1")
 		filter := adminPostFilter{
-			Search: strings.TrimSpace(c.Query("q")),
-			Status: sanitizePostStatus(c.Query("status")),
+			Search:     strings.TrimSpace(c.Query("q")),
+			Status:     sanitizePostStatus(c.Query("status")),
+			CategoryID: parseAdminCategoryID(c.Query("category_id")),
 		}
 		page := 1
 		fmt.Sscanf(pageStr, "%d", &page)
@@ -1392,6 +1393,31 @@ func main() {
 					stickyMap[id] = true
 				}
 			}
+		}
+
+		categoryRows, err := db.Query(`SELECT mid, name FROM typecho_metas WHERE type='category' ORDER BY "order" ASC, mid ASC`)
+		if err != nil {
+			c.String(500, err.Error())
+			return
+		}
+		defer categoryRows.Close()
+
+		var categories []map[string]interface{}
+		for categoryRows.Next() {
+			var mid int
+			var name string
+			if err := categoryRows.Scan(&mid, &name); err != nil {
+				c.String(500, err.Error())
+				return
+			}
+			categories = append(categories, map[string]interface{}{
+				"Mid":  mid,
+				"Name": name,
+			})
+		}
+		if err := categoryRows.Err(); err != nil {
+			c.String(500, err.Error())
+			return
 		}
 
 		orderBy := "created DESC"
@@ -1446,9 +1472,11 @@ func main() {
 			"Username":     username,
 			"UserGroup":    group,
 			"Posts":        posts,
+			"Categories":   categories,
 			"SearchQuery":  filter.Search,
 			"StatusFilter": filter.Status,
-			"QuerySuffix":  adminListQuerySuffix(map[string]string{"q": filter.Search, "status": filter.Status}),
+			"CategoryID":   filter.CategoryID,
+			"QuerySuffix":  adminListQuerySuffix(map[string]string{"q": filter.Search, "category_id": strconv.Itoa(filter.CategoryID), "status": filter.Status}),
 			"Tab":          "posts",
 			"CurrentPage":  page,
 			"TotalPages":   totalPages,

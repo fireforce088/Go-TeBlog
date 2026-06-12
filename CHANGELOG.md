@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.1.2 - 2026-06-12
+
+### Added
+
+- **文章管理分类筛选**: 在文章管理列表页面增加分类下拉框，支持按分类筛选文章。三个筛选条件（标题关键词 + 分类 + 状态）可组合使用。查询使用参数化 EXISTS 子查询，防 SQL 注入。筛选后条件保持，分页参数完整保留。无匹配时显示友好提示。
+
+### Changed
+
+- **admin_helpers.go**: `AdminPostFilter` 加 `CategoryID` 字段、新增 `parseAdminCategoryID()` 函数、`buildPostFilterWhere` 加分类 EXISTS 子查询
+- **admin.go**: 解析 `category_id` 查询参数、加载分类列表传入模板、分页链接保留分类参数
+- **admin_helpers_test.go**: 测试覆盖参数化查询和非法值边界
+- **templates/admin/admin_posts.html**: 筛选栏布局重排，新增分类下拉框，保持选中状态
+
+## 0.1.1 - 2026-06-12
+
+### Added
+
+- **Mermaid 图表渲染**: Mermaid.js v11 CDN 集成，支持在文章中使用 ` ```mermaid ` 代码块渲染流程图、时序图、类图等。Goldmark 渲染后客户端自动将 `<pre><code class=\"language-mermaid\">` 转换为 `<pre class=\"mermaid\">` 并初始化渲染。支持亮色/暗色主题自适应（`data-theme` 属性联动）。仅在 `post.html` 加载 CDN，与 KaTeX 模式一致。
+
 ## 0.1.0 - 2026-06-12
 
 ### Added

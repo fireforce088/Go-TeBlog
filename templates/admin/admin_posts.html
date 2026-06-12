@@ -390,6 +390,14 @@
             width: 240px;
         }
 
+        .filter-form select {
+            min-width: 132px;
+        }
+
+        .filter-form select[name="category_id"] {
+            min-width: 150px;
+        }
+
         .filter-form input:focus,
         .filter-form select:focus {
             border-color: #0984e3;
@@ -410,6 +418,13 @@
             color: #64748b;
             text-decoration: none;
             font-size: 13px;
+        }
+
+        .empty-row td {
+            text-align: center;
+            color: #64748b;
+            padding: 34px 16px;
+            background: #fff;
         }
 
         .clear-filter:hover {
@@ -467,6 +482,12 @@
             <a href="{{adminPath}}/edit/new" class="btn btn-new" style="margin-bottom:0;">发布新文章</a>
             <form method="GET" action="{{adminPath}}/posts" class="filter-form">
                 <input type="text" name="q" value="{{.SearchQuery}}" placeholder="按标题搜索">
+                <select name="category_id">
+                    <option value="" {{if eq .CategoryID 0}}selected{{end}}>全部分类</option>
+                    {{range .Categories}}
+                    <option value="{{.Mid}}" {{if eq $.CategoryID .Mid}}selected{{end}}>{{.Name}}</option>
+                    {{end}}
+                </select>
                 <select name="status">
                     <option value="" {{if eq .StatusFilter ""}}selected{{end}}>全部状态</option>
                     <option value="publish" {{if eq .StatusFilter "publish"}}selected{{end}}>已发布</option>
@@ -476,7 +497,7 @@
                     <option value="waiting" {{if eq .StatusFilter "waiting"}}selected{{end}}>待审核</option>
                 </select>
                 <button type="submit" class="btn-filter">筛选</button>
-                {{if or .SearchQuery .StatusFilter}}
+                {{if or .SearchQuery .StatusFilter .CategoryID}}
                 <a href="{{adminPath}}/posts" class="clear-filter">清空</a>
                 {{end}}
             </form>
@@ -519,6 +540,10 @@
                             </form>
                         </div>
                     </td>
+                </tr>
+                {{else}}
+                <tr class="empty-row">
+                    <td colspan="5">没有找到符合筛选条件的文章</td>
                 </tr>
                 {{end}}
             </tbody>

@@ -122,20 +122,42 @@ func TestGenerateAdminPasswordUsesEightAlphanumericCharacters(t *testing.T) {
 }
 
 func TestBuildPostFilterQueryUsesParameters(t *testing.T) {
-	filter := adminPostFilter{Search: "%' OR 1=1 --", Status: "publish"}
+	filter := adminPostFilter{Search: "%' OR 1=1 --", Status: "publish", CategoryID: 3}
 	where, args := buildPostFilterWhere(filter, false)
 
 	if strings.Contains(where, filter.Search) {
 		t.Fatalf("search text should not be interpolated into SQL: %s", where)
 	}
-	if len(args) != 2 {
+	if strings.Contains(where, "3") {
+		t.Fatalf("category ID should not be interpolated into SQL: %s", where)
+	}
+	if !strings.Contains(where, "EXISTS") {
+		t.Fatalf("expected category filter to use EXISTS: %s", where)
+	}
+	if len(args) != 3 {
 		t.Fatalf("unexpected args: %#v", args)
 	}
 	seen := map[interface{}]bool{}
 	for _, arg := range args {
 		seen[arg] = true
 	}
-	if !seen["%"+filter.Search+"%"] || !seen["publish"] {
+	if !seen["%"+filter.Search+"%"] || !seen["publish"] || !seen[3] {
 		t.Fatalf("unexpected args: %#v", args)
+	}
+}
+
+func TestParseAdminCategoryIDIgnoresInvalidValues(t *testing.T) {
+	cases := map[string]int{
+		"":     0,
+		"0":    0,
+		"-1":   0,
+		"abc":  0,
+		" 12 ": 12,
+	}
+
+	for input, want := range cases {
+		if got := parseAdminCategoryID(input); got != want {
+			t.Fatalf("parseAdminCategoryID(%q) = %d, want %d", input, got, want)
+		}
 	}
 }

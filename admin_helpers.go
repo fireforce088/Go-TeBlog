@@ -204,8 +204,9 @@ func adminCSRFMiddleware(adminPath string) gin.HandlerFunc {
 }
 
 type adminPostFilter struct {
-	Search string
-	Status string
+	Search     string
+	Status     string
+	CategoryID int
 }
 
 type adminCommentFilter struct {
@@ -220,6 +221,14 @@ func sanitizePostStatus(status string) string {
 	default:
 		return ""
 	}
+}
+
+func parseAdminCategoryID(value string) int {
+	id, err := strconv.Atoi(strings.TrimSpace(value))
+	if err != nil || id < 1 {
+		return 0
+	}
+	return id
 }
 
 func sanitizeCommentStatus(status string) string {
@@ -243,6 +252,14 @@ func buildPostFilterWhere(filter adminPostFilter, visitorOnly bool) (string, []i
 	if filter.Search = strings.TrimSpace(filter.Search); filter.Search != "" {
 		clauses = append(clauses, "title LIKE ?")
 		args = append(args, "%"+filter.Search+"%")
+	}
+	if filter.CategoryID > 0 {
+		clauses = append(clauses, `EXISTS (
+			SELECT 1 FROM typecho_relationships r
+			JOIN typecho_metas m ON m.mid = r.mid
+			WHERE r.cid = typecho_contents.cid AND r.mid = ? AND m.type = 'category'
+		)`)
+		args = append(args, filter.CategoryID)
 	}
 	return " WHERE " + strings.Join(clauses, " AND "), args
 }
