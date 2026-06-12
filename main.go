@@ -4,22 +4,18 @@ import (
 	"bytes"
 	"crypto/rand"
 	"database/sql"
-	"encoding/json"
 	"encoding/xml"
 	"flag"
 	"fmt"
 	"html/template"
-	"io"
 	"log"
 	"math/big"
-	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -59,191 +55,6 @@ var commentLimiter = &commentAttemptLimiter{
 
 const generatedPasswordAlphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 
-type cloudflareShieldManager struct {
-	db *sql.DB
-
-	mu               sync.Mutex
-	currentMinuteKey int64
-	currentMinuteCnt int
-	currentMinuteIPs map[string]int
-	currentMinuteHit map[string]string
-	cfgLoadedAt      int64
-	threshold        int
-	apiToken         string
-	authEmail        string
-	zoneID           string
-	restoreLevel     string
-	autoDisableMins  int
-	autoBlockIP      bool
-	shieldActive     bool
-	shieldUntil      int64
-	switching        bool
-	failCooldownTill int64
-}
-
-type cfBlockCandidate struct {
-	IP   string
-	Path string
-	Hits int
-}
-
-type cfBlockedIPRule struct {
-	IP     string `json:"ip"`
-	RuleID string `json:"rule_id"`
-}
-
-func newCloudflareShieldManager(db *sql.DB) *cloudflareShieldManager {
-	mgr := &cloudflareShieldManager{
-		db:               db,
-		threshold:        1000,
-		restoreLevel:     "medium",
-		autoDisableMins:  30,
-		currentMinuteIPs: make(map[string]int),
-		currentMinuteHit: make(map[string]string),
-	}
-
-	if getOption(db, "cfShieldActive", "0") == "1" {
-		mgr.shieldActive = true
-	}
-	mgr.shieldUntil = getOptionInt64(db, "cfShieldUntil", 0)
-
-	return mgr
-}
-
-func (m *cloudflareShieldManager) loadConfigLocked(now int64) {
-	// 限制配置读取频率，避免每个请求都查库
-	if now-m.cfgLoadedAt < 10 {
-		return
-	}
-	m.cfgLoadedAt = now
-
-	limit := getOptionInt(m.db, "cfRequestLimitPerMinute", 1000)
-	if limit < 1 {
-		limit = 1000
-	}
-
-	m.threshold = limit
-	m.apiToken = strings.TrimSpace(getOption(m.db, "cfApiToken", ""))
-	m.authEmail = strings.TrimSpace(getOption(m.db, "cfAuthEmail", ""))
-	m.zoneID = strings.TrimSpace(getOption(m.db, "cfZoneID", ""))
-	m.restoreLevel = sanitizeSecurityLevel(getOption(m.db, "cfRestoreSecurityLevel", "medium"))
-	m.autoBlockIP = getOption(m.db, "cfShieldAutoBlockIP", "0") == "1"
-	autoDisableMins := getOptionInt(m.db, "cfShieldAutoDisableMinutes", 30)
-	if autoDisableMins < 1 {
-		autoDisableMins = 30
-	}
-	m.autoDisableMins = autoDisableMins
-}
-
-func (m *cloudflareShieldManager) middleware(adminPath string) gin.HandlerFunc {
-	return func(c *gin.Context) {
-		path := c.Request.URL.Path
-		if strings.HasPrefix(path, adminPath) {
-			c.Next()
-			return
-		}
-
-		now := time.Now().Unix()
-		minuteKey := now / 60
-
-		needEnable := false
-		triggerIP := ""
-		triggerPath := ""
-		blockCandidates := []cfBlockCandidate{}
-
-		m.mu.Lock()
-		m.loadConfigLocked(now)
-		if m.currentMinuteKey != minuteKey {
-			m.currentMinuteKey = minuteKey
-			m.currentMinuteCnt = 0
-			m.currentMinuteIPs = make(map[string]int)
-			m.currentMinuteHit = make(map[string]string)
-		}
-		m.currentMinuteCnt++
-		ip := clientIPFromRequest(c)
-		if ip != "" {
-			m.currentMinuteIPs[ip]++
-			if _, ok := m.currentMinuteHit[ip]; !ok {
-				path := c.Request.URL.Path
-				if path == "" {
-					path = "/"
-				}
-				m.currentMinuteHit[ip] = path
-			}
-		}
-
-		if !m.shieldActive &&
-			!m.switching &&
-			now >= m.failCooldownTill &&
-			m.apiToken != "" &&
-			m.zoneID != "" &&
-			m.currentMinuteCnt > m.threshold {
-			triggerIP, triggerPath = m.topMinuteSourceLocked()
-			blockCandidates = m.blockCandidatesLocked()
-			m.switching = true
-			needEnable = true
-		}
-		m.mu.Unlock()
-
-		if needEnable {
-			go m.enableShield(triggerIP, triggerPath, blockCandidates)
-		}
-
-		c.Next()
-	}
-}
-
-func (m *cloudflareShieldManager) topMinuteSourceLocked() (string, string) {
-	var topIP string
-	var topPath string
-	maxHits := 0
-	for ip, hits := range m.currentMinuteIPs {
-		if hits > maxHits {
-			maxHits = hits
-			topIP = ip
-			topPath = m.currentMinuteHit[ip]
-		}
-	}
-	if topPath == "" {
-		topPath = "/"
-	}
-	return topIP, topPath
-}
-
-func (m *cloudflareShieldManager) blockCandidatesLocked() []cfBlockCandidate {
-	minHits := m.threshold / 10
-	if minHits < 30 {
-		minHits = 30
-	}
-
-	candidates := make([]cfBlockCandidate, 0, len(m.currentMinuteIPs))
-	for ip, hits := range m.currentMinuteIPs {
-		if hits < minHits || !isBlockableIP(ip) {
-			continue
-		}
-		path := m.currentMinuteHit[ip]
-		if path == "" {
-			path = "/"
-		}
-		candidates = append(candidates, cfBlockCandidate{IP: ip, Path: path, Hits: hits})
-	}
-	sort.Slice(candidates, func(i, j int) bool {
-		return candidates[i].Hits > candidates[j].Hits
-	})
-	if len(candidates) > 10 {
-		candidates = candidates[:10]
-	}
-	return candidates
-}
-
-func isBlockableIP(ip string) bool {
-	parsed := net.ParseIP(strings.TrimSpace(ip))
-	if parsed == nil {
-		return false
-	}
-	return parsed.IsGlobalUnicast() && !parsed.IsPrivate() && !parsed.IsLoopback()
-}
-
 func clientIPFromRequest(c *gin.Context) string {
 	ip := strings.TrimSpace(c.GetHeader("CF-Connecting-IP"))
 	if ip != "" {
@@ -251,267 +62,6 @@ func clientIPFromRequest(c *gin.Context) string {
 	}
 
 	return strings.TrimSpace(c.ClientIP())
-}
-
-func (m *cloudflareShieldManager) enableShield(triggerIP, triggerPath string, blockCandidates []cfBlockCandidate) {
-	now := time.Now().Unix()
-
-	m.mu.Lock()
-	m.loadConfigLocked(now)
-	token := m.apiToken
-	authEmail := m.authEmail
-	zoneID := m.zoneID
-	autoDisableMins := m.autoDisableMins
-	autoBlockIP := m.autoBlockIP
-	if m.shieldActive || token == "" || zoneID == "" {
-		m.switching = false
-		m.mu.Unlock()
-		return
-	}
-	m.mu.Unlock()
-
-	err := updateCloudflareSecurityLevel(token, authEmail, zoneID, "under_attack")
-	if err != nil {
-		m.mu.Lock()
-		m.switching = false
-		m.failCooldownTill = time.Now().Unix() + 300
-		m.mu.Unlock()
-		return
-	}
-
-	expiresAt := time.Now().Add(time.Duration(autoDisableMins) * time.Minute).Unix()
-	setOption(m.db, "cfShieldActive", "1")
-	setOption(m.db, "cfShieldUntil", strconv.FormatInt(expiresAt, 10))
-	setOption(m.db, "cfShieldActivatedAt", strconv.FormatInt(now, 10))
-	logID := int64(0)
-	if strings.TrimSpace(triggerIP) != "" {
-		if strings.TrimSpace(triggerPath) == "" {
-			triggerPath = "/"
-		}
-		res, err := m.db.Exec("INSERT INTO go_cf_shield_logs (ip, path, ua, blocked_ips, created) VALUES (?, ?, ?, ?, ?)", triggerIP, triggerPath, "threshold-trigger", "", now)
-		if err != nil {
-			log.Printf("Cloudflare 五秒盾触发日志写入失败: %v", err)
-		} else if res != nil {
-			logID, _ = res.LastInsertId()
-		}
-	}
-	log.Printf("Cloudflare 五秒盾已开启，预计关闭时间: %s", time.Unix(expiresAt, 0).Format("2006-01-02 15:04:05"))
-
-	m.mu.Lock()
-	m.shieldActive = true
-	m.shieldUntil = expiresAt
-	m.switching = false
-	m.mu.Unlock()
-
-	if autoBlockIP && len(blockCandidates) > 0 {
-		go blockCloudflareIPs(m.db, logID, token, authEmail, zoneID, blockCandidates)
-	}
-}
-
-func blockCloudflareIPs(db *sql.DB, logID int64, token, authEmail, zoneID string, candidates []cfBlockCandidate) {
-	blockedRules := make([]cfBlockedIPRule, 0, len(candidates))
-	for i, candidate := range candidates {
-		if i > 0 {
-			time.Sleep(time.Second)
-		}
-		ruleID, err := blockCloudflareIP(token, authEmail, zoneID, candidate.IP, "Go-TeBlog 五秒盾自动拉黑")
-		if err != nil {
-			log.Printf("Cloudflare 五秒盾自动拉黑 IP 失败: %s: %v", candidate.IP, err)
-		} else {
-			blockedRules = append(blockedRules, cfBlockedIPRule{IP: candidate.IP, RuleID: ruleID})
-			log.Printf("Cloudflare 五秒盾已自动拉黑 IP: %s，分钟命中: %d", candidate.IP, candidate.Hits)
-		}
-	}
-	if db != nil && logID > 0 && len(blockedRules) > 0 {
-		blockedRulesJSON, err := json.Marshal(blockedRules)
-		if err != nil {
-			log.Printf("Cloudflare 五秒盾自动拉黑 IP 序列化失败: %v", err)
-			return
-		}
-		if _, err := db.Exec("UPDATE go_cf_shield_logs SET blocked_ips = ? WHERE id = ?", string(blockedRulesJSON), logID); err != nil {
-			log.Printf("Cloudflare 五秒盾自动拉黑 IP 写入失败: %v", err)
-		}
-	}
-}
-
-func (m *cloudflareShieldManager) disableShieldIfNeeded() {
-	now := time.Now().Unix()
-
-	m.mu.Lock()
-	m.loadConfigLocked(now)
-	token := m.apiToken
-	authEmail := m.authEmail
-	zoneID := m.zoneID
-	restoreLevel := m.restoreLevel
-	active := m.shieldActive
-	expiresAt := m.shieldUntil
-	switching := m.switching
-	if !active || switching || expiresAt == 0 || now < expiresAt || token == "" || zoneID == "" {
-		m.mu.Unlock()
-		return
-	}
-	m.switching = true
-	m.mu.Unlock()
-
-	err := updateCloudflareSecurityLevel(token, authEmail, zoneID, restoreLevel)
-	if err != nil {
-		m.mu.Lock()
-		m.switching = false
-		m.failCooldownTill = time.Now().Unix() + 300
-		m.mu.Unlock()
-		return
-	}
-
-	setOption(m.db, "cfShieldActive", "0")
-	setOption(m.db, "cfShieldUntil", "0")
-
-	log.Printf("Cloudflare 五秒盾已关闭，恢复等级: %s", restoreLevel)
-
-	m.mu.Lock()
-	m.shieldActive = false
-	m.shieldUntil = 0
-	m.switching = false
-	m.mu.Unlock()
-}
-
-func (m *cloudflareShieldManager) startAutoDisableWorker(stop <-chan struct{}) {
-	ticker := time.NewTicker(15 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ticker.C:
-			m.disableShieldIfNeeded()
-		case <-stop:
-			return
-		}
-	}
-}
-
-func sanitizeSecurityLevel(level string) string {
-	switch strings.TrimSpace(strings.ToLower(level)) {
-	case "essentially_off", "low", "medium", "high":
-		return strings.TrimSpace(strings.ToLower(level))
-	default:
-		return "medium"
-	}
-}
-
-func updateCloudflareSecurityLevel(apiToken, authEmail, zoneID, level string) error {
-	payload, _ := json.Marshal(map[string]string{
-		"value": level,
-	})
-
-	endpoint := fmt.Sprintf("https://api.cloudflare.com/client/v4/zones/%s/settings/security_level", zoneID)
-	req, err := http.NewRequest(http.MethodPatch, endpoint, bytes.NewBuffer(payload))
-	if err != nil {
-		return fmt.Errorf("构建 Cloudflare 请求失败: %w", err)
-	}
-	if authEmail != "" {
-		req.Header.Set("X-Auth-Email", authEmail)
-		req.Header.Set("X-Auth-Key", apiToken)
-	} else {
-		req.Header.Set("Authorization", "Bearer "+apiToken)
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return fmt.Errorf("Cloudflare 请求失败: %w", err)
-	}
-	defer resp.Body.Close()
-
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("Cloudflare 返回状态 %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
-	}
-
-	var apiResp struct {
-		Success bool `json:"success"`
-		Errors  []struct {
-			Message string `json:"message"`
-		} `json:"errors"`
-	}
-	if err := json.Unmarshal(body, &apiResp); err == nil {
-		if !apiResp.Success {
-			if len(apiResp.Errors) > 0 && apiResp.Errors[0].Message != "" {
-				return fmt.Errorf("Cloudflare 返回错误: %s", apiResp.Errors[0].Message)
-			}
-			return fmt.Errorf("Cloudflare 返回失败: %s", strings.TrimSpace(string(body)))
-		}
-	}
-
-	return nil
-}
-
-func blockCloudflareIP(apiToken, authEmail, zoneID, ip, note string) (string, error) {
-	ip = strings.TrimSpace(ip)
-	zoneID = strings.TrimSpace(zoneID)
-	if ip == "" {
-		return "", nil
-	}
-	if zoneID == "" {
-		return "", fmt.Errorf("Cloudflare Zone ID 为空")
-	}
-
-	payload, _ := json.Marshal(map[string]interface{}{
-		"mode": "block",
-		"configuration": map[string]string{
-			"target": "ip",
-			"value":  ip,
-		},
-		"notes": note,
-	})
-
-	endpoint := fmt.Sprintf("https://api.cloudflare.com/client/v4/zones/%s/firewall/access_rules/rules", zoneID)
-	req, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewBuffer(payload))
-	if err != nil {
-		return "", fmt.Errorf("构建 Cloudflare 拉黑请求失败: %w", err)
-	}
-	if authEmail != "" {
-		req.Header.Set("X-Auth-Email", authEmail)
-		req.Header.Set("X-Auth-Key", apiToken)
-	} else {
-		req.Header.Set("Authorization", "Bearer "+apiToken)
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("Cloudflare 拉黑请求失败: %w", err)
-	}
-	defer resp.Body.Close()
-
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return "", fmt.Errorf("Cloudflare 拉黑返回状态 %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
-	}
-
-	var apiResp struct {
-		Success bool `json:"success"`
-		Result  struct {
-			ID string `json:"id"`
-		} `json:"result"`
-		Errors []struct {
-			Message string `json:"message"`
-		} `json:"errors"`
-	}
-	if err := json.Unmarshal(body, &apiResp); err == nil {
-		if !apiResp.Success {
-			if len(apiResp.Errors) > 0 && apiResp.Errors[0].Message != "" {
-				return "", fmt.Errorf("Cloudflare 拉黑返回错误: %s", apiResp.Errors[0].Message)
-			}
-			return "", fmt.Errorf("Cloudflare 拉黑返回失败: %s", strings.TrimSpace(string(body)))
-		}
-		if strings.TrimSpace(apiResp.Result.ID) == "" {
-			return "", fmt.Errorf("Cloudflare 拉黑返回规则 ID 为空")
-		}
-		return apiResp.Result.ID, nil
-	}
-
-	return "", fmt.Errorf("Cloudflare 拉黑返回解析失败")
 }
 
 func (l *commentAttemptLimiter) addAndCount(ip string, now int64) (int, int) {
@@ -587,16 +137,6 @@ func startJanitor(db *sql.DB) {
 				rows, _ := res.RowsAffected()
 				if rows > 0 {
 					log.Printf("Janitor: cleaned up %d old log records.", rows)
-				}
-			}
-
-			res, err = db.Exec("DELETE FROM go_cf_shield_logs WHERE created < ?", cutoff)
-			if err != nil {
-				log.Printf("Janitor shield log error: %v", err)
-			} else {
-				rows, _ := res.RowsAffected()
-				if rows > 0 {
-					log.Printf("Janitor: cleaned up %d old Cloudflare shield log records.", rows)
 				}
 			}
 		}
@@ -1124,13 +664,6 @@ func main() {
 		adminPath = "/" + adminPath
 	}
 	adminPath = strings.TrimSuffix(adminPath, "/")
-
-	cfShieldManager := newCloudflareShieldManager(db)
-	cfShieldStop := make(chan struct{})
-	go cfShieldManager.startAutoDisableWorker(cfShieldStop)
-
-	// 前台分钟级流量阈值检查，达到阈值时触发 Cloudflare 五秒盾。
-	r.Use(cfShieldManager.middleware(adminPath))
 	// 应用访问统计中间件
 	r.Use(statsMiddleware(db, adminPath))
 	// 应用 Beacon 动态注入中间件 (排除后台)
@@ -1562,34 +1095,6 @@ func main() {
 			return
 		}
 
-		// AI Spam Check
-		apiKey := getOption(db, "grokApiKey", "")
-		if getOption(db, "commentAiDetection", "0") == "1" && apiKey != "" {
-			apiUrl := getOption(db, "aiApiUrl", "https://api.groq.com/openai/v1/chat/completions")
-			model := getOption(db, "aiModel", "llama-3.3-70b-versatile")
-			threshold := getOptionInt(db, "aiThreshold", 5)
-			failClosed := getOption(db, "commentFailClosed", "0") == "1"
-			score, err := checkSpamAI(words, apiKey, apiUrl, model)
-			if err != nil && failClosed {
-				site := getSiteInfo(db)
-				c.HTML(http.StatusServiceUnavailable, "error.html", gin.H{
-					"Site":         site,
-					"ErrorTitle":   "评论发布失败",
-					"ErrorMessage": "评论发布失败，请稍后再试。",
-				})
-				return
-			}
-			if score > threshold {
-				site := getSiteInfo(db)
-				c.HTML(http.StatusForbidden, "error.html", gin.H{
-					"Site":         site,
-					"ErrorTitle":   "评论被拒绝",
-					"ErrorMessage": "抱歉，系统检测到您的评论可能包含不当内容。如果这是误判，请修改后重新提交。",
-				})
-				return
-			}
-		}
-
 		// Get post author for ownerId
 		var ownerId int
 		err := db.QueryRow("SELECT authorId FROM typecho_contents WHERE cid=?", cid).Scan(&ownerId)
@@ -1844,7 +1349,6 @@ func main() {
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("listen: %s\n", err)
 	}
-	close(cfShieldStop)
 	log.Println("Waiting for statistics worker to finish...")
 	close(statsChan)
 	statsWG.Wait()
@@ -1987,17 +1491,8 @@ func initDB(db *sql.DB) {
 			"is_bot" INTEGER DEFAULT 0,
 			"created" INTEGER
 		)`,
-		`CREATE TABLE IF NOT EXISTS "go_cf_shield_logs" (
-			"id" INTEGER PRIMARY KEY AUTOINCREMENT,
-			"ip" VARCHAR(64),
-			"path" VARCHAR(255),
-			"ua" VARCHAR(511),
-			"blocked_ips" TEXT,
-			"created" INTEGER
-		)`,
 		`CREATE INDEX IF NOT EXISTS "idx_stats_created" ON "go_stats_logs" ("created")`,
 		`CREATE INDEX IF NOT EXISTS "idx_stats_bot" ON "go_stats_logs" ("is_bot")`,
-		`CREATE INDEX IF NOT EXISTS "idx_cf_shield_logs_created" ON "go_cf_shield_logs" ("created")`,
 	}
 
 	for _, s := range schema {
@@ -2007,10 +1502,6 @@ func initDB(db *sql.DB) {
 		}
 	}
 	ensureCategoryProtectionColumnsMain(db)
-	_, err := db.Exec(`ALTER TABLE go_cf_shield_logs ADD COLUMN blocked_ips TEXT`)
-	if err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
-		log.Printf("Error updating Cloudflare shield logs table: %v", err)
-	}
 
 	// Bootstrap a default category if none exists
 	var catCount int
@@ -2811,78 +2302,4 @@ func getPrevNextPosts(db *sql.DB, created int64) (*Post, *Post) {
 	return prev, next
 }
 
-func stripThinkingOutput(content string) string {
-	thinkBlockRE := regexp.MustCompile(`(?is)<think\b[^>]*>.*?</think>`)
-	codeFenceRE := regexp.MustCompile("(?is)```(?:[a-z0-9_+-]+)?\\s*(.*?)\\s*```")
 
-	cleaned := thinkBlockRE.ReplaceAllString(content, " ")
-	cleaned = codeFenceRE.ReplaceAllString(cleaned, "$1")
-
-	return strings.TrimSpace(cleaned)
-}
-
-func extractSpamScore(content string) (int, bool) {
-	cleaned := stripThinkingOutput(content)
-	scoreRE := regexp.MustCompile(`\b([0-9])\b`)
-	match := scoreRE.FindStringSubmatch(cleaned)
-	if len(match) < 2 {
-		return 0, false
-	}
-
-	score, err := strconv.Atoi(match[1])
-	if err != nil {
-		return 0, false
-	}
-
-	return score, true
-}
-
-func checkSpamAI(words string, apiKey string, apiUrl string, model string) (int, error) {
-	if apiKey == "" || apiUrl == "" || model == "" {
-		return 0, fmt.Errorf("ai moderation config missing")
-	}
-
-	systemPrompt := "You are an assistant for detecting spam, advertisements, meaningless text, political content, religious content, and malicious content such as SQL injection or XSS. Score user input from 0 to 9, where 0 means safe (e.g., programming or server-related), 5 means suspicious, and 9 means confirmed spam, ads, political or religious content, attacks, or nonsense like \"asdf\", \"12345\", \"aaaa\". If the input is not in English or Chinese, score it as 9. Only return a single integer (0–9) with no explanation."
-
-	requestData := map[string]interface{}{
-		"model": model,
-		"messages": []map[string]string{
-			{"role": "system", "content": systemPrompt},
-			{"role": "user", "content": words},
-		},
-		"max_tokens":  1,
-		"temperature": 0.1,
-	}
-
-	jsonData, _ := json.Marshal(requestData)
-	client := &http.Client{Timeout: 5 * time.Second}
-	req, _ := http.NewRequest("POST", apiUrl, bytes.NewBuffer(jsonData))
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+apiKey)
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return 0, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode == 200 {
-		var result struct {
-			Choices []struct {
-				Message struct {
-					Content string `json:"content"`
-				} `json:"message"`
-			} `json:"choices"`
-		}
-		if err := json.NewDecoder(resp.Body).Decode(&result); err == nil && len(result.Choices) > 0 {
-			content := strings.TrimSpace(result.Choices[0].Message.Content)
-			if score, ok := extractSpamScore(content); ok {
-				return score, nil
-			}
-			return 0, fmt.Errorf("ai moderation response invalid")
-		}
-		return 0, fmt.Errorf("ai moderation decode failed")
-	}
-
-	return 0, fmt.Errorf("ai moderation status: %d", resp.StatusCode)
-}

@@ -208,3 +208,11 @@
 
 - Changed the frontend-to-admin proxy target to `127.0.0.1:8191` for local dual-process and Docker runtime compatibility.
 - Fixed frontend template year rendering.
+
+## 0.1.3 - 2026-06-12
+
+### Removed
+
+- **Cloudflare 五秒盾**: 移除项目内置的 Cloudflare 五秒盾/访问防护功能。包括：自动安全等级切换、IP 自动拉黑、流量阈值检测、五秒盾中间件、相关路由、数据库表、设置页面配置项、仪表盘日志面板。外部 Cloudflare Tunnel/Access 不受影响。
+- **AI 评论检测**: 移除 AI 评论垃圾检测和 AI 攻击类型分析功能。包括：评论提交时的 AI 评分、AI 测试接口、AI 系统设置配置项、所有相关后台函数（checkSpamAI、callAIChatCompletionText、extractSpamScore 等）。普通评论审核功能保留。
+- **文档清理**: README.md 和 PROJECT_GUIDE.md 中相关功能描述已删除。

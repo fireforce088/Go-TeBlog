@@ -4,7 +4,7 @@
 
 ## 1. 项目定位
 
-Go-TeBlog 是一个用 Go 实现的轻量博客系统，数据结构尽量兼容 Typecho。项目使用 SQLite 作为本地数据库，使用 Gin 提供 HTTP 服务，前台页面使用 Go HTML 模板渲染，后台提供文章、分类、评论、附件、用户、设置、备份、Cloudflare 防护等管理能力。
+Go-TeBlog 是一个用 Go 实现的轻量博客系统，数据结构尽量兼容 Typecho。项目使用 SQLite 作为本地数据库，使用 Gin 提供 HTTP 服务，前台页面使用 Go HTML 模板渲染，后台提供文章、分类、评论、附件、用户、设置、备份等管理能力。
 
 当前项目采用“双进程”设计：
 
@@ -26,7 +26,7 @@ Go-TeBlog 是一个用 Go 实现的轻量博客系统，数据结构尽量兼容
 
 ```text
 .
-├── main.go                         # 前台博客服务：文章展示、评论、统计、sitemap、Cloudflare 5 秒盾触发
+├── main.go                         # 前台博客服务：文章展示、评论、统计、sitemap
 ├── admin.go                        # 后台管理服务：登录、仪表盘、文章/评论/分类/用户/设置/备份
 ├── admin_helpers.go                # 后台辅助逻辑：登录限制、Cookie、安全过滤、系统信息
 ├── admin_helpers_test.go           # 后台辅助逻辑测试
@@ -56,8 +56,6 @@ flowchart LR
     Proxy --> Admin["后台服务 admin.go :8191"]
     Admin --> AdminTemplates["后台模板 templates/admin"]
     Admin --> DB
-    Admin --> CF["Cloudflare API"]
-    Frontend --> CF
 ```
 
 请求入口默认是 `8190`。后台路径默认为 `/admin`，但会从数据库配置项 `adminPath` 读取。当前前台服务把匹配后台路径的请求转发到后台服务。
@@ -76,7 +74,6 @@ flowchart LR
 - 提供 `/usr` 和 `/blog/usr` 静态资源访问。
 - 记录访问统计。
 - 使用 Beacon 区分真实访问和机器人流量。
-- 根据访问频率触发 Cloudflare 安全等级调整和 IP 拉黑。
 - 将后台路径请求反向代理到 `8191`。
 
 主要前台路由：
@@ -122,12 +119,10 @@ GET  /api/stats/beacon
 - 分类管理、排序、首页显示控制、下线控制。
 - 附件管理和引用清理。
 - 用户新增、编辑、删除、密码修改。
-- 系统设置、皮肤设置、AI 检测测试、Cloudflare 测试。
+- 系统设置、皮肤设置。
 - 数据库和上传目录备份。
 - 数据库 VACUUM。
 - 重启前台和后台 systemd 服务。
-- 查询 Cloudflare 日志并调用 AI 分析攻击类型。
-- 解除 Cloudflare 自动拉黑的 IP 规则。
 
 主要后台路由以 `adminPath` 为前缀，默认是 `/admin`：
 
@@ -141,8 +136,6 @@ GET  /admin/settings
 POST /admin/settings
 GET  /admin/settings/skin
 POST /admin/settings/skin
-POST /admin/settings/ai-test
-POST /admin/settings/cloudflare-test
 GET  /admin/posts
 GET  /admin/edit/:cid
 POST /admin/save
@@ -213,14 +206,13 @@ blog.sqlite
 - `go_options`：后台扩展配置。
 - `go_category_settings`：分类首页显示和下线状态。
 - `go_stats_logs`：访问统计日志。
-- `go_cf_shield_logs`：Cloudflare 5 秒盾触发日志。
 
 ## 8. 配置来源
 
 项目主要配置来自数据库：
 
 - `typecho_options`：站点标题、描述、关键词、主题、站点 URL、时区等。
-- `go_options`：后台路径、会话超时、AI 配置、Cloudflare 配置、统计配置、分类设置等扩展配置。
+- `go_options`：后台路径、会话超时、统计配置、分类设置等扩展配置。
 
 重要配置项包括：
 
@@ -229,8 +221,6 @@ blog.sqlite
 - `theme`：当前主题。
 - `siteUrl`：站点 URL。
 - `timezone`：时区，默认 `Asia/Shanghai`。
-- AI 检测相关配置：API Key、API URL、模型名等。
-- Cloudflare 相关配置：API Token、邮箱、Zone ID、安全等级、触发阈值、自动恢复时间等。
 
 ## 9. 模板与主题
 
@@ -365,7 +355,7 @@ internal/
 ├── db/           # 数据库初始化和查询
 ├── frontend/     # 前台 handler
 ├── admin/        # 后台 handler
-├── security/     # 登录、Cookie、限流、Cloudflare
+├── security/     # 登录、Cookie、限流
 ├── stats/        # 访问统计和 Beacon
 └── view/         # 模板数据结构和渲染辅助
 ```
@@ -425,7 +415,7 @@ go build -o admin_app admin.go admin_helpers.go
 ```
 
 - 后台路径 `adminPath` 是否符合预期。
-- Cloudflare 和 AI 配置是否为空或已正确设置。
+- 配置是否已正确设置。
 
 如果只是做页面和文案修改，优先查看：
 

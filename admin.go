@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"crypto/md5"
 	"crypto/rand"
 	"database/sql"
@@ -9,7 +8,6 @@ import (
 	"flag"
 	"fmt"
 	"html/template"
-	"io"
 	"log"
 	"math/big"
 	"net/http"
@@ -35,18 +33,6 @@ var (
 	backupMutex        sync.Mutex
 	systemTimeLocation = time.Local
 )
-
-type cloudflareAccessLogItem struct {
-	Datetime string `json:"datetime"`
-	Method   string `json:"method"`
-	URL      string `json:"url"`
-	Status   int    `json:"status"`
-}
-
-type cfBlockedIPRule struct {
-	IP     string `json:"ip"`
-	RuleID string `json:"rule_id"`
-}
 
 func getSkinConfig(db *sql.DB) SkinConfig {
 	theme := sanitizeThemeName(getOption(db, "theme", "default"), "default")
@@ -260,27 +246,6 @@ func main() {
 		log.Fatal("Failed to create category settings table:", err)
 	}
 	ensureCategoryProtectionColumnsAdmin(db)
-
-	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS go_cf_shield_logs (
-		id INTEGER PRIMARY KEY AUTOINCREMENT,
-		ip VARCHAR(64),
-		path VARCHAR(255),
-		ua VARCHAR(511),
-		blocked_ips TEXT,
-		created INTEGER
-	)`)
-	if err != nil {
-		log.Fatal("Failed to create Cloudflare shield logs table:", err)
-	}
-	_, err = db.Exec(`ALTER TABLE go_cf_shield_logs ADD COLUMN blocked_ips TEXT`)
-	if err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
-		log.Fatal("Failed to update Cloudflare shield logs table:", err)
-	}
-
-	_, err = db.Exec(`CREATE INDEX IF NOT EXISTS idx_cf_shield_logs_created ON go_cf_shield_logs (created)`)
-	if err != nil {
-		log.Fatal("Failed to create Cloudflare shield logs index:", err)
-	}
 
 	if err := ensureInitialAdminUser(db); err != nil {
 		log.Fatal("Failed to ensure initial admin user:", err)
@@ -649,38 +614,6 @@ func main() {
 			botVisitorTrendJSON = []byte("[]")
 		}
 
-		type cfShieldLogItem struct {
-			ID         int64
-			IP         string
-			Path       string
-			Created    int64
-			CreatedAt  string
-			UA         string
-			BlockedIPs string
-		}
-
-		var cfShieldLogCount int
-		var latestCfShieldIP string
-		var latestCfShieldCreated int64
-		var cfShieldLogs []cfShieldLogItem
-
-		db.QueryRow("SELECT COUNT(*) FROM go_cf_shield_logs").Scan(&cfShieldLogCount)
-		db.QueryRow("SELECT COALESCE(ip, ''), COALESCE(created, 0) FROM go_cf_shield_logs ORDER BY created DESC, id DESC LIMIT 1").Scan(&latestCfShieldIP, &latestCfShieldCreated)
-
-		rows, err := db.Query("SELECT id, COALESCE(ip, ''), COALESCE(path, '/'), COALESCE(ua, ''), COALESCE(blocked_ips, ''), created FROM go_cf_shield_logs ORDER BY created DESC, id DESC LIMIT 10")
-		if err == nil {
-			defer rows.Close()
-			for rows.Next() {
-				var item cfShieldLogItem
-				var created int64
-				if err := rows.Scan(&item.ID, &item.IP, &item.Path, &item.UA, &item.BlockedIPs, &created); err == nil {
-					item.Created = created
-					item.CreatedAt = time.Unix(created, 0).Format("2006-01-02 15:04:05")
-					cfShieldLogs = append(cfShieldLogs, item)
-				}
-			}
-		}
-
 		// 数据库大小
 		dbFile, _ := os.Stat("blog.sqlite")
 		dbSize := "0 MB"
@@ -731,23 +664,6 @@ func main() {
 			}
 		}
 
-		cfShieldActive := getOption(db, "cfShieldActive", "0") == "1"
-		cfShieldStatus := "未激活"
-		cfShieldUntil := "未开启"
-		cfShieldLatest := "暂无拦截日志"
-		if cfShieldActive {
-			cfShieldStatus = "已开启"
-			untilUnix, err := strconv.ParseInt(strings.TrimSpace(getOption(db, "cfShieldUntil", "0")), 10, 64)
-			if err == nil && untilUnix > 0 {
-				cfShieldUntil = time.Unix(untilUnix, 0).Format("2006-01-02 15:04:05")
-			} else {
-				cfShieldUntil = "已开启（未获取到关闭时间）"
-			}
-		}
-		if latestCfShieldIP != "" && latestCfShieldCreated > 0 {
-			cfShieldLatest = fmt.Sprintf("最近触发来源: %s / %s", latestCfShieldIP, time.Unix(latestCfShieldCreated, 0).Format("2006-01-02 15:04:05"))
-		}
-
 		c.HTML(http.StatusOK, "admin_dashboard.html", gin.H{
 			"Username":              username,
 			"UserGroup":             group,
@@ -785,14 +701,6 @@ func main() {
 			"BackupSize":            fmt.Sprintf("%.2f MB", getDirSize("backups")),
 			"DiskFree":              diskFree,
 			"SysLoad":               sysLoad,
-			"CfShieldActive":        cfShieldActive,
-			"CfShieldStatus":        cfShieldStatus,
-			"CfShieldUntil":         cfShieldUntil,
-			"CfShieldLogCount":      cfShieldLogCount,
-			"CfShieldLatest":        cfShieldLatest,
-			"CfShieldLogs":          cfShieldLogs,
-			"CfMinuteLimit":         getOption(db, "cfRequestLimitPerMinute", "1000"),
-			"CfAutoDisableMinutes":  getOption(db, "cfShieldAutoDisableMinutes", "30"),
 		})
 	})
 
@@ -892,27 +800,6 @@ func main() {
 		}
 
 		group, _ := c.Get("userGroup")
-		apiKey := getOption(db, "grokApiKey", "")
-		if group == "visitor" && apiKey != "" {
-			apiKey = "********************************"
-		}
-		cfApiToken := getOption(db, "cfApiToken", "")
-		cfAuthEmail := getOption(db, "cfAuthEmail", "")
-		cfZoneID := getOption(db, "cfZoneID", "")
-		if group == "visitor" && cfApiToken != "" {
-			cfApiToken = "********************************"
-		}
-		if group == "visitor" && cfAuthEmail != "" {
-			cfAuthEmail = "********************************"
-		}
-		if group == "visitor" && cfZoneID != "" {
-			cfZoneID = "********************************"
-		}
-		cfEnvConnected := isCloudflareRequest(c)
-		cfEnvStatus := "当前未接入 Cloudflare"
-		if cfEnvConnected {
-			cfEnvStatus = "当前已接入 Cloudflare"
-		}
 
 		c.HTML(http.StatusOK, "admin_settings.html", gin.H{
 			"Username":                   username,
@@ -928,7 +815,6 @@ func main() {
 			"ConfigAdminPath":            getOption(db, "adminPath", "admin"),
 			"FrontendServiceName":        getOption(db, "frontendServiceName", "blog"),
 			"AdminServiceName":           getOption(db, "adminServiceName", "blogadmin"),
-			"AiThreshold":                getOption(db, "aiThreshold", "5"),
 			"SessionTimeout":             getOption(db, "sessionTimeout", "30"),
 			"SiteKeywords":               getOption(db, "keywords", ""),
 			"FooterCode":                 getOption(db, "footerCode", ""),
@@ -937,27 +823,13 @@ func main() {
 			"RecentCommentsSize":         getOption(db, "recentCommentsSize", "10"),
 			"ShowDateArchives":           getOption(db, "showDateArchives", "1"),
 			"DateArchivesSize":           getOption(db, "dateArchivesSize", "12"),
-			"GrokApiKey":                 apiKey,
-			"AiApiUrl":                   getOption(db, "aiApiUrl", "https://api.groq.com/openai/v1/chat/completions"),
-			"AiModel":                    getOption(db, "aiModel", "llama-3.3-70b-versatile"),
-			"CommentAiDetection":         getOption(db, "commentAiDetection", "1"),
 			"DefaultCategory":            getOption(db, "defaultCategory", "1"),
 			"CommentAudit":               getOption(db, "commentAudit", "0"),
-			"CommentFailClosed":          getOption(db, "commentFailClosed", "0"),
 			"StatsBufferSize":            getOption(db, "statsBufferSize", "100"),
 			"LogRetentionDays":           getOption(db, "logRetentionDays", "30"),
 			"CommentLimitIP":             getOption(db, "commentLimitIP", "1"),
 			"CommentLimitGlobal":         getOption(db, "commentLimitGlobal", "2"),
 			"CommentsEnabled":            getOption(db, "commentsEnabled", "1"),
-			"CfRequestLimitPerMinute":    getOption(db, "cfRequestLimitPerMinute", "1000"),
-			"CfApiToken":                 cfApiToken,
-			"CfAuthEmail":                cfAuthEmail,
-			"CfZoneID":                   cfZoneID,
-			"CfRestoreSecurityLevel":     getOption(db, "cfRestoreSecurityLevel", "medium"),
-			"CfShieldAutoDisableMinutes": getOption(db, "cfShieldAutoDisableMinutes", "30"),
-			"CfShieldAutoBlockIP":        getOption(db, "cfShieldAutoBlockIP", "0"),
-			"CfEnvConnected":             cfEnvConnected,
-			"CfEnvStatus":                cfEnvStatus,
 			"AllCategories":              categories,
 			"SuccessMessage":             successMessage,
 		})
@@ -1056,11 +928,6 @@ func main() {
 		if dateArchivesSize == "" {
 			dateArchivesSize = "12"
 		}
-		grokApiKey := c.PostForm("grokApiKey")
-		aiApiUrl := c.PostForm("aiApiUrl")
-		aiModel := c.PostForm("aiModel")
-		aiThreshold := c.PostForm("aiThreshold")
-		commentAiDetection := c.DefaultPostForm("commentAiDetection", "0")
 		sessionTimeout := c.PostForm("sessionTimeout")
 		keywords := c.PostForm("keywords")
 		footerCode := c.PostForm("footerCode")
@@ -1071,28 +938,11 @@ func main() {
 		frontendServiceName := strings.TrimSpace(c.PostForm("frontendServiceName"))
 		adminServiceName := strings.TrimSpace(c.PostForm("adminServiceName"))
 		commentAudit := c.DefaultPostForm("commentAudit", "0")
-		commentFailClosed := c.DefaultPostForm("commentFailClosed", "0")
 		statsBufferSize := c.PostForm("statsBufferSize")
 		logRetentionDays := c.PostForm("logRetentionDays")
 		commentLimitIP := c.PostForm("commentLimitIP")
 		commentLimitGlobal := c.PostForm("commentLimitGlobal")
 		commentsEnabled := c.DefaultPostForm("commentsEnabled", "0")
-		cfRequestLimitPerMinute := strings.TrimSpace(c.PostForm("cfRequestLimitPerMinute"))
-		cfApiToken := strings.TrimSpace(c.PostForm("cfApiToken"))
-		cfAuthEmail := strings.TrimSpace(c.PostForm("cfAuthEmail"))
-		cfZoneID := strings.TrimSpace(c.PostForm("cfZoneID"))
-		cfRestoreSecurityLevel := strings.TrimSpace(c.PostForm("cfRestoreSecurityLevel"))
-		cfShieldAutoDisableMinutes := strings.TrimSpace(c.PostForm("cfShieldAutoDisableMinutes"))
-		cfShieldAutoBlockIP := c.DefaultPostForm("cfShieldAutoBlockIP", "0")
-		if cfRequestLimitPerMinute == "" {
-			cfRequestLimitPerMinute = "1000"
-		}
-		if cfRestoreSecurityLevel == "" {
-			cfRestoreSecurityLevel = "medium"
-		}
-		if cfShieldAutoDisableMinutes == "" {
-			cfShieldAutoDisableMinutes = "30"
-		}
 		if frontendServiceName == "" {
 			frontendServiceName = "blog"
 		}
@@ -1115,29 +965,16 @@ func main() {
 		setOption(db, "recentCommentsSize", recentCommentsSize)
 		setOption(db, "showDateArchives", showDateArchives)
 		setOption(db, "dateArchivesSize", dateArchivesSize)
-		setOption(db, "grokApiKey", grokApiKey)
-		setOption(db, "aiApiUrl", aiApiUrl)
-		setOption(db, "aiModel", aiModel)
-		setOption(db, "aiThreshold", aiThreshold)
-		setOption(db, "commentAiDetection", commentAiDetection)
 		setOption(db, "sessionTimeout", sessionTimeout)
 		setOption(db, "keywords", keywords)
 		setOption(db, "footerCode", footerCode)
 		setOption(db, "defaultCategory", defaultCategory)
 		setOption(db, "commentAudit", commentAudit)
-		setOption(db, "commentFailClosed", commentFailClosed)
 		setOption(db, "statsBufferSize", statsBufferSize)
 		setOption(db, "logRetentionDays", logRetentionDays)
 		setOption(db, "commentLimitIP", commentLimitIP)
 		setOption(db, "commentLimitGlobal", commentLimitGlobal)
 		setOption(db, "commentsEnabled", commentsEnabled)
-		setOption(db, "cfRequestLimitPerMinute", cfRequestLimitPerMinute)
-		setOption(db, "cfApiToken", cfApiToken)
-		setOption(db, "cfAuthEmail", cfAuthEmail)
-		setOption(db, "cfZoneID", cfZoneID)
-		setOption(db, "cfRestoreSecurityLevel", cfRestoreSecurityLevel)
-		setOption(db, "cfShieldAutoDisableMinutes", cfShieldAutoDisableMinutes)
-		setOption(db, "cfShieldAutoBlockIP", cfShieldAutoBlockIP)
 		applyConfiguredTimezone(db)
 
 		successMsg := "设置保存成功"
@@ -1146,221 +983,6 @@ func main() {
 		}
 
 		renderSettingsPage(c, activeSection, successMsg)
-	})
-
-	admin.GET("/dashboard/cloudflare-access-logs", func(c *gin.Context) {
-		ip := strings.TrimSpace(c.Query("ip"))
-		created, err := strconv.ParseInt(strings.TrimSpace(c.Query("created")), 10, 64)
-		if ip == "" || err != nil || created <= 0 {
-			c.JSON(http.StatusBadRequest, gin.H{
-				"ok":      false,
-				"message": "查询参数不完整。",
-			})
-			return
-		}
-
-		apiToken := strings.TrimSpace(getOption(db, "cfApiToken", ""))
-		authEmail := strings.TrimSpace(getOption(db, "cfAuthEmail", ""))
-		zoneID := strings.TrimSpace(getOption(db, "cfZoneID", ""))
-		if apiToken == "" || zoneID == "" {
-			c.JSON(http.StatusOK, gin.H{
-				"ok":      false,
-				"message": "当前系统未设置 Cloudflare API Token 或 Zone ID。",
-			})
-			return
-		}
-
-		logs, err := queryCloudflareAccessLogs(apiToken, authEmail, zoneID, ip, created)
-		if err != nil {
-			c.JSON(http.StatusOK, gin.H{
-				"ok":      false,
-				"message": err.Error(),
-			})
-			return
-		}
-
-		c.JSON(http.StatusOK, gin.H{
-			"ok":   true,
-			"logs": logs,
-		})
-	})
-
-	admin.POST("/dashboard/cloudflare-access-analysis", func(c *gin.Context) {
-		var req struct {
-			Logs []cloudflareAccessLogItem `json:"logs"`
-		}
-		if err := c.ShouldBindJSON(&req); err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{
-				"ok":      false,
-				"message": "日志参数不完整。",
-			})
-			return
-		}
-		if len(req.Logs) == 0 {
-			c.JSON(http.StatusOK, gin.H{
-				"ok":       true,
-				"analysis": "当前没有可分析的访问记录。",
-			})
-			return
-		}
-
-		aiURL := strings.TrimSpace(getOption(db, "aiApiUrl", "https://api.groq.com/openai/v1/chat/completions"))
-		aiKey := strings.TrimSpace(getOption(db, "grokApiKey", ""))
-		aiModel := strings.TrimSpace(getOption(db, "aiModel", ""))
-		analysis, err := analyzeCloudflareAttackType(aiKey, aiURL, aiModel, req.Logs)
-		if err != nil {
-			analysis = "AI 分析失败：" + err.Error()
-		}
-
-		c.JSON(http.StatusOK, gin.H{
-			"ok":       true,
-			"analysis": analysis,
-		})
-	})
-
-	admin.POST("/dashboard/cloudflare-unblock-ips", writeProtectMiddleware, func(c *gin.Context) {
-		var req struct {
-			LogID int64 `json:"log_id"`
-		}
-		if err := c.ShouldBindJSON(&req); err != nil || req.LogID <= 0 {
-			c.JSON(http.StatusBadRequest, gin.H{
-				"ok":      false,
-				"message": "日志参数不完整。",
-			})
-			return
-		}
-
-		var blockedIPsText string
-		if err := db.QueryRow("SELECT COALESCE(blocked_ips, '') FROM go_cf_shield_logs WHERE id = ?", req.LogID).Scan(&blockedIPsText); err != nil {
-			c.JSON(http.StatusOK, gin.H{
-				"ok":      false,
-				"message": "未找到对应五秒盾日志。",
-			})
-			return
-		}
-
-		blockedRules, err := parseCloudflareBlockedRules(blockedIPsText)
-		if err != nil {
-			c.JSON(http.StatusOK, gin.H{
-				"ok":      false,
-				"message": err.Error(),
-			})
-			return
-		}
-		if len(blockedRules) == 0 {
-			c.JSON(http.StatusOK, gin.H{
-				"ok":      true,
-				"message": "当前没有需要解除的黑名单 IP。",
-			})
-			return
-		}
-
-		apiToken := strings.TrimSpace(getOption(db, "cfApiToken", ""))
-		authEmail := strings.TrimSpace(getOption(db, "cfAuthEmail", ""))
-		zoneID := strings.TrimSpace(getOption(db, "cfZoneID", ""))
-		if apiToken == "" || zoneID == "" {
-			c.JSON(http.StatusOK, gin.H{
-				"ok":      false,
-				"message": "当前系统未设置 Cloudflare API Token 或 Zone ID。",
-			})
-			return
-		}
-
-		failedRules := unblockCloudflareBlockedRules(apiToken, authEmail, zoneID, blockedRules)
-		failedRulesJSON, err := json.Marshal(failedRules)
-		if err != nil {
-			c.JSON(http.StatusOK, gin.H{
-				"ok":      false,
-				"message": "解除结果序列化失败。",
-			})
-			return
-		}
-
-		if _, err := db.Exec("UPDATE go_cf_shield_logs SET blocked_ips = ? WHERE id = ?", string(failedRulesJSON), req.LogID); err != nil {
-			c.JSON(http.StatusOK, gin.H{
-				"ok":      false,
-				"message": "解除成功，但本地日志更新失败。",
-			})
-			return
-		}
-
-		if len(failedRules) > 0 {
-			c.JSON(http.StatusOK, gin.H{
-				"ok":          false,
-				"message":     "部分 IP 解除失败。",
-				"blocked_ips": failedRules,
-			})
-			return
-		}
-
-		c.JSON(http.StatusOK, gin.H{
-			"ok":          true,
-			"message":     "已解除这批 Cloudflare 黑名单 IP。",
-			"blocked_ips": []string{},
-		})
-	})
-
-	admin.POST("/settings/ai-test", writeProtectMiddleware, func(c *gin.Context) {
-		apiKey := strings.TrimSpace(c.PostForm("grokApiKey"))
-		apiURL := strings.TrimSpace(c.PostForm("aiApiUrl"))
-		model := strings.TrimSpace(c.PostForm("aiModel"))
-		testContent := strings.TrimSpace(c.PostForm("aiTestContent"))
-		if apiKey == "" || apiURL == "" || model == "" {
-			c.JSON(http.StatusBadRequest, gin.H{
-				"ok":      false,
-				"message": "请先填写 AI API URL、AI Model 和 AI API Key。",
-			})
-			return
-		}
-		if testContent == "" {
-			testContent = "这是一条正常的测试评论，用于检测评论过滤 AI 接口是否可正常调用。"
-		}
-
-		score, err := checkSpamAITestComment(testContent, apiKey, apiURL, model)
-		if err != nil {
-			c.JSON(http.StatusOK, gin.H{
-				"ok":      false,
-				"message": "调用失败：" + err.Error(),
-			})
-			return
-		}
-
-		c.JSON(http.StatusOK, gin.H{
-			"ok":      true,
-			"message": fmt.Sprintf("AI 接口连接正常，评论检测服务已就绪，得分：%d。", score),
-			"score":   score,
-		})
-	})
-
-	admin.POST("/settings/cloudflare-test", writeProtectMiddleware, func(c *gin.Context) {
-		apiToken := strings.TrimSpace(c.PostForm("cfApiToken"))
-		authEmail := strings.TrimSpace(c.PostForm("cfAuthEmail"))
-		zoneID := strings.TrimSpace(c.PostForm("cfZoneID"))
-		if apiToken == "" || zoneID == "" {
-			c.JSON(http.StatusBadRequest, gin.H{
-				"ok":      false,
-				"message": "请先填写 Cloudflare API Token 和 Zone ID。",
-			})
-			return
-		}
-
-		zoneName, err := testCloudflareCredentials(apiToken, authEmail, zoneID)
-		if err != nil {
-			c.JSON(http.StatusOK, gin.H{
-				"ok":      false,
-				"message": "检测失败：" + err.Error(),
-			})
-			return
-		}
-
-		msg := "Cloudflare 接口连接正常，配置已可用。"
-		if zoneName != "" {
-			msg = fmt.Sprintf("Cloudflare 接口连接正常，当前站点 %s 配置已可用。", zoneName)
-		}
-		c.JSON(http.StatusOK, gin.H{
-			"ok":      true,
-			"message": msg,
-		})
 	})
 
 	admin.GET("/posts", func(c *gin.Context) {
@@ -2867,429 +2489,6 @@ func normalizeTimezoneOption(tz string) string {
 	}
 }
 
-func stripThinkingOutput(content string) string {
-	thinkBlockRE := regexp.MustCompile(`(?is)<think\b[^>]*>.*?</think>`)
-	codeFenceRE := regexp.MustCompile("(?is)```(?:[a-z0-9_+-]+)?\\s*(.*?)\\s*```")
-
-	cleaned := thinkBlockRE.ReplaceAllString(content, " ")
-	cleaned = codeFenceRE.ReplaceAllString(cleaned, "$1")
-
-	return strings.TrimSpace(cleaned)
-}
-
-func compactAIText(content string) string {
-	cleaned := stripThinkingOutput(content)
-	if idx := strings.IndexAny(cleaned, "\r\n"); idx >= 0 {
-		cleaned = cleaned[:idx]
-	}
-	return strings.TrimSpace(cleaned)
-}
-
-func extractSpamScore(content string) (int, bool) {
-	cleaned := stripThinkingOutput(content)
-	scoreRE := regexp.MustCompile(`\b([0-9])\b`)
-	match := scoreRE.FindStringSubmatch(cleaned)
-	if len(match) < 2 {
-		return 0, false
-	}
-
-	score, err := strconv.Atoi(match[1])
-	if err != nil {
-		return 0, false
-	}
-
-	return score, true
-}
-
-func callAIChatCompletionText(apiKey, apiURL string, requestData map[string]interface{}) (string, error) {
-	if apiKey == "" || apiURL == "" {
-		return "", fmt.Errorf("AI 配置缺失：请填写 AI API URL 和 AI API Key")
-	}
-
-	jsonData, err := json.Marshal(requestData)
-	if err != nil {
-		return "", fmt.Errorf("AI 请求组装失败: %w", err)
-	}
-
-	client := &http.Client{Timeout: 5 * time.Second}
-	req, err := http.NewRequest(http.MethodPost, apiURL, bytes.NewBuffer(jsonData))
-	if err != nil {
-		return "", fmt.Errorf("AI 请求创建失败: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+apiKey)
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("AI 请求发送失败: %w", err)
-	}
-	defer resp.Body.Close()
-
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-	if resp.StatusCode != http.StatusOK {
-		detail := strings.TrimSpace(string(body))
-		if detail != "" {
-			return "", fmt.Errorf("AI 接口返回状态 %d: %s", resp.StatusCode, detail)
-		}
-		return "", fmt.Errorf("AI 接口返回状态 %d", resp.StatusCode)
-	}
-
-	var result struct {
-		Choices []struct {
-			Message struct {
-				Content any `json:"content"`
-			} `json:"message"`
-			Text string `json:"text"`
-		} `json:"choices"`
-		OutputText string `json:"output_text"`
-		Text       string `json:"text"`
-	}
-	if err := json.Unmarshal(body, &result); err != nil {
-		return "", fmt.Errorf("AI 响应解析失败: %w; 原始返回: %s", err, strings.TrimSpace(string(body)))
-	}
-
-	content := ""
-	if len(result.Choices) > 0 {
-		if s, ok := result.Choices[0].Message.Content.(string); ok {
-			content = strings.TrimSpace(s)
-		}
-		if content == "" {
-			content = strings.TrimSpace(result.Choices[0].Text)
-		}
-	}
-	if content == "" {
-		content = strings.TrimSpace(result.OutputText)
-	}
-	if content == "" {
-		content = strings.TrimSpace(result.Text)
-	}
-	if content == "" {
-		return "", fmt.Errorf("AI 响应为空，原始返回: %s", strings.TrimSpace(string(body)))
-	}
-
-	return compactAIText(content), nil
-}
-
-func checkSpamAITestComment(words string, apiKey string, apiURL string, model string) (int, error) {
-	if apiKey == "" || apiURL == "" || model == "" {
-		return 0, fmt.Errorf("AI 检测配置缺失：请填写 AI API URL、AI Model 和 AI API Key")
-	}
-
-	systemPrompt := "You are an assistant for detecting spam, advertisements, meaningless text, political content, religious content, and malicious content such as SQL injection or XSS. Score user input from 0 to 9, where 0 means safe (e.g., programming or server-related), 5 means suspicious, and 9 means confirmed spam, ads, political or religious content, attacks, or nonsense like \"asdf\", \"12345\", \"aaaa\". If the input is not in English or Chinese, score it as 9. Only return a single integer (0–9) with no explanation."
-
-	requestData := map[string]interface{}{
-		"model": model,
-		"messages": []map[string]string{
-			{"role": "system", "content": systemPrompt},
-			{"role": "user", "content": words},
-		},
-		"max_tokens":  512,
-		"temperature": 0,
-	}
-
-	content, err := callAIChatCompletionText(apiKey, apiURL, requestData)
-	if err != nil {
-		return 0, fmt.Errorf("AI 检测失败: %w", err)
-	}
-	score, ok := extractSpamScore(content)
-	if !ok {
-		return 0, fmt.Errorf("AI 检测响应格式不符合预期：%s", content)
-	}
-
-	return score, nil
-}
-
-func analyzeCloudflareAttackType(apiKey, apiURL, model string, logs []cloudflareAccessLogItem) (string, error) {
-	if apiKey == "" || apiURL == "" || model == "" {
-		return "未配置 AI，未生成攻击类型说明。", nil
-	}
-	if len(logs) == 0 {
-		return "当前没有可分析的访问记录。", nil
-	}
-
-	var builder strings.Builder
-	builder.WriteString("根据以下 Cloudflare 访问记录判断最可能的攻击类型。")
-	builder.WriteString("只输出正文 content，输出4到8个汉字，不要解释，不要分点。\n\n记录：\n")
-	for i, logItem := range logs {
-		url := strings.TrimSpace(logItem.URL)
-		if len(url) > 220 {
-			url = url[:220]
-		}
-		builder.WriteString(fmt.Sprintf("%d. %s %s %d %s\n", i+1, logItem.Datetime, logItem.Method, logItem.Status, url))
-	}
-
-	requestData := map[string]interface{}{
-		"model": model,
-		"messages": []map[string]string{
-			{"role": "system", "content": "你是网站安全分析助手，只输出正文 content 里的中文短语，不要解释。"},
-			{"role": "user", "content": builder.String()},
-		},
-		"max_tokens":  4096,
-		"temperature": 0,
-	}
-
-	content, err := callAIChatCompletionText(apiKey, apiURL, requestData)
-	if err != nil {
-		return "", err
-	}
-	if content == "" {
-		return "", fmt.Errorf("AI 攻击类型说明为空")
-	}
-	return content, nil
-}
-
-func parseCloudflareBlockedRules(value string) ([]cfBlockedIPRule, error) {
-	value = strings.TrimSpace(value)
-	if value == "" {
-		return []cfBlockedIPRule{}, nil
-	}
-
-	var rules []cfBlockedIPRule
-	if err := json.Unmarshal([]byte(value), &rules); err != nil {
-		return nil, fmt.Errorf("黑名单 IP 数据格式错误")
-	}
-
-	cleaned := make([]cfBlockedIPRule, 0, len(rules))
-	for _, rule := range rules {
-		rule.IP = strings.TrimSpace(rule.IP)
-		rule.RuleID = strings.TrimSpace(rule.RuleID)
-		if rule.IP == "" || rule.RuleID == "" {
-			return nil, fmt.Errorf("黑名单 IP 数据缺少规则 ID")
-		}
-		cleaned = append(cleaned, rule)
-	}
-	return cleaned, nil
-}
-
-func unblockCloudflareBlockedRules(apiToken, authEmail, zoneID string, rules []cfBlockedIPRule) []cfBlockedIPRule {
-	failedRules := make([]cfBlockedIPRule, 0)
-	for _, rule := range rules {
-		if err := deleteCloudflareAccessRule(apiToken, authEmail, zoneID, rule.RuleID); err != nil {
-			log.Printf("Cloudflare 五秒盾解除黑名单 IP 失败: %s: %v", rule.IP, err)
-			failedRules = append(failedRules, rule)
-		} else {
-			log.Printf("Cloudflare 五秒盾已解除黑名单 IP: %s", rule.IP)
-		}
-	}
-	return failedRules
-}
-
-func deleteCloudflareAccessRule(apiToken, authEmail, zoneID, ruleID string) error {
-	endpoint := fmt.Sprintf("https://api.cloudflare.com/client/v4/zones/%s/firewall/access_rules/rules/%s", zoneID, ruleID)
-	req, err := http.NewRequest(http.MethodDelete, endpoint, nil)
-	if err != nil {
-		return fmt.Errorf("构建 Cloudflare 黑名单解除请求失败: %w", err)
-	}
-	setCloudflareAuthHeaders(req, apiToken, authEmail)
-
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return fmt.Errorf("Cloudflare 黑名单解除请求失败: %w", err)
-	}
-	defer resp.Body.Close()
-
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("Cloudflare 黑名单解除返回状态 %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
-	}
-
-	var apiResp struct {
-		Success bool `json:"success"`
-		Errors  []struct {
-			Message string `json:"message"`
-		} `json:"errors"`
-	}
-	if err := json.Unmarshal(body, &apiResp); err == nil {
-		if !apiResp.Success {
-			if len(apiResp.Errors) > 0 && apiResp.Errors[0].Message != "" {
-				return fmt.Errorf("Cloudflare 黑名单解除错误: %s", apiResp.Errors[0].Message)
-			}
-			return fmt.Errorf("Cloudflare 黑名单解除失败: %s", strings.TrimSpace(string(body)))
-		}
-	}
-	return nil
-}
-
-func setCloudflareAuthHeaders(req *http.Request, apiToken, authEmail string) {
-	if authEmail != "" {
-		req.Header.Set("X-Auth-Email", authEmail)
-		req.Header.Set("X-Auth-Key", apiToken)
-	} else {
-		req.Header.Set("Authorization", "Bearer "+apiToken)
-	}
-	req.Header.Set("Content-Type", "application/json")
-}
-
-func queryCloudflareAccessLogs(apiToken, authEmail, zoneID, ip string, created int64) ([]cloudflareAccessLogItem, error) {
-	startTime := time.Unix(created, 0).UTC()
-	start := startTime.Format(time.RFC3339)
-	end := startTime.Add(24 * time.Hour).Format(time.RFC3339)
-	query := `query GetCloudflareAccessLogs($zoneTag: string, $filter: filter) {
-		viewer {
-			zones(filter: { zoneTag: $zoneTag }) {
-				logs: httpRequestsAdaptive(limit: 20, orderBy: [datetime_ASC], filter: $filter) {
-					datetime
-					clientRequestHTTPHost
-					clientRequestHTTPMethodName
-					clientRequestPath
-					clientRequestQuery
-					clientRequestScheme
-					edgeResponseStatus
-				}
-			}
-		}
-	}`
-	payload, _ := json.Marshal(map[string]interface{}{
-		"query": query,
-		"variables": map[string]interface{}{
-			"zoneTag": zoneID,
-			"filter": map[string]interface{}{
-				"AND": []map[string]interface{}{
-					{"datetime_geq": start, "datetime_leq": end},
-					{"clientIP": ip},
-					{"requestSource": "eyeball"},
-				},
-			},
-		},
-	})
-
-	req, err := http.NewRequest(http.MethodPost, "https://api.cloudflare.com/client/v4/graphql", bytes.NewBuffer(payload))
-	if err != nil {
-		return nil, fmt.Errorf("构建 Cloudflare 查询失败: %w", err)
-	}
-	if authEmail != "" {
-		req.Header.Set("X-Auth-Email", authEmail)
-		req.Header.Set("X-Auth-Key", apiToken)
-	} else {
-		req.Header.Set("Authorization", "Bearer "+apiToken)
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	client := &http.Client{Timeout: 12 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("Cloudflare 查询失败: %w", err)
-	}
-	defer resp.Body.Close()
-
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 65536))
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("Cloudflare 返回状态 %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
-	}
-
-	var apiResp struct {
-		Data struct {
-			Viewer struct {
-				Zones []struct {
-					Logs []struct {
-						Datetime                    string `json:"datetime"`
-						ClientRequestHTTPHost       string `json:"clientRequestHTTPHost"`
-						ClientRequestHTTPMethodName string `json:"clientRequestHTTPMethodName"`
-						ClientRequestPath           string `json:"clientRequestPath"`
-						ClientRequestQuery          string `json:"clientRequestQuery"`
-						ClientRequestScheme         string `json:"clientRequestScheme"`
-						EdgeResponseStatus          int    `json:"edgeResponseStatus"`
-					} `json:"logs"`
-				} `json:"zones"`
-			} `json:"viewer"`
-		} `json:"data"`
-		Errors []struct {
-			Message string `json:"message"`
-		} `json:"errors"`
-	}
-	if err := json.Unmarshal(body, &apiResp); err != nil {
-		return nil, fmt.Errorf("Cloudflare 查询返回解析失败")
-	}
-	if len(apiResp.Errors) > 0 {
-		if apiResp.Errors[0].Message != "" {
-			return nil, fmt.Errorf("Cloudflare 查询错误: %s", apiResp.Errors[0].Message)
-		}
-		return nil, fmt.Errorf("Cloudflare 查询失败")
-	}
-	if len(apiResp.Data.Viewer.Zones) == 0 {
-		return []cloudflareAccessLogItem{}, nil
-	}
-
-	logs := make([]cloudflareAccessLogItem, 0, len(apiResp.Data.Viewer.Zones[0].Logs))
-	for _, row := range apiResp.Data.Viewer.Zones[0].Logs {
-		scheme := strings.TrimSpace(row.ClientRequestScheme)
-		if scheme == "" {
-			scheme = "https"
-		}
-		requestURL := strings.TrimSpace(row.ClientRequestPath)
-		host := strings.TrimSpace(row.ClientRequestHTTPHost)
-		if host != "" {
-			requestURL = scheme + "://" + host + requestURL
-		}
-		if strings.TrimSpace(row.ClientRequestQuery) != "" {
-			requestURL += "?" + strings.TrimSpace(row.ClientRequestQuery)
-		}
-
-		datetime := row.Datetime
-		if parsed, err := time.Parse(time.RFC3339, row.Datetime); err == nil {
-			datetime = parsed.In(systemTimeLocation).Format("2006-01-02 15:04:05")
-		}
-
-		logs = append(logs, cloudflareAccessLogItem{
-			Datetime: datetime,
-			Method:   row.ClientRequestHTTPMethodName,
-			URL:      requestURL,
-			Status:   row.EdgeResponseStatus,
-		})
-	}
-
-	return logs, nil
-}
-
-func testCloudflareCredentials(apiToken, authEmail, zoneID string) (string, error) {
-	endpoint := fmt.Sprintf("https://api.cloudflare.com/client/v4/zones/%s", zoneID)
-	req, err := http.NewRequest(http.MethodGet, endpoint, nil)
-	if err != nil {
-		return "", fmt.Errorf("构建 Cloudflare 请求失败: %w", err)
-	}
-
-	if authEmail != "" {
-		req.Header.Set("X-Auth-Email", authEmail)
-		req.Header.Set("X-Auth-Key", apiToken)
-	} else {
-		req.Header.Set("Authorization", "Bearer "+apiToken)
-	}
-
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("Cloudflare 请求失败: %w", err)
-	}
-	defer resp.Body.Close()
-
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return "", fmt.Errorf("Cloudflare 返回状态 %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
-	}
-
-	var apiResp struct {
-		Success bool `json:"success"`
-		Result  struct {
-			Name string `json:"name"`
-		} `json:"result"`
-		Errors []struct {
-			Message string `json:"message"`
-		} `json:"errors"`
-	}
-	if err := json.Unmarshal(body, &apiResp); err != nil {
-		return "", fmt.Errorf("Cloudflare 返回解析失败")
-	}
-	if !apiResp.Success {
-		if len(apiResp.Errors) > 0 && apiResp.Errors[0].Message != "" {
-			return "", fmt.Errorf("Cloudflare 返回错误: %s", apiResp.Errors[0].Message)
-		}
-		return "", fmt.Errorf("Cloudflare 返回失败")
-	}
-
-	return strings.TrimSpace(apiResp.Result.Name), nil
-}
-
 func getOption(db *sql.DB, name string, defaultValue string) string {
 	var val string
 	err := db.QueryRow("SELECT value FROM go_options WHERE name=?", name).Scan(&val)
@@ -3322,16 +2521,6 @@ func setOption(db *sql.DB, name string, value string) {
 	if err != nil {
 		log.Printf("Error setting option %s: %v", name, err)
 	}
-}
-
-func isCloudflareRequest(c *gin.Context) bool {
-	if strings.TrimSpace(c.GetHeader("CF-Connecting-IP")) != "" {
-		return true
-	}
-	if strings.TrimSpace(c.GetHeader("CF-Ray")) != "" {
-		return true
-	}
-	return false
 }
 
 func cryptPrivate(password string, setting string) string {
