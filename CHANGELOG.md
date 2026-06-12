@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.0.12 - 2026-06-12
+
+### Fixed
+
+- **CSS 中 `rgba()` 默认值被 Go html/template 替换为 `ZgotmplZ`**: Go 的 `html/template` 包在 `<style>` 上下文中对 CSS 值做安全过滤，`rgba(r,g,b,a)` 写法被判定为"不安全 CSS 值"，3 个 CSS 变量（`--header-bg`、`--theme-btn-hover-bg`、`--theme-btn-active-bg`）渲染为 `ZgotmplZ`，导致 `:root {}` 规则块被部分浏览器（尤其移动端 WebView）丢弃，CSS 内容泄漏到页面正文显示。已将 `rgba()` 默认值替换为等效的 8 位 hex 色值（`#RRGGBBAA`），Go CSS 安全过滤器接受 hex 格式。涉及文件：`main.go`、`admin.go`、`usr/themes/default/style.css`。
+
 ## 0.0.11 - 2026-06-12
 
 ### Fixed
