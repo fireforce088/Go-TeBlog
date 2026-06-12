@@ -38,30 +38,7 @@
             padding: 0.5em 0;
         }
     </style>
-        :root,
-        :root[data-theme='dark'] {
-            --primary-color: {{.Site.Skin.PrimaryColor}};
-            --primary-hover: {{.Site.Skin.PrimaryHover}};
-            --success-color: {{.Site.Skin.SuccessColor}};
-            --text-primary: {{.Site.Skin.TextPrimary}};
-            --text-secondary: {{.Site.Skin.TextSecondary}};
-            --text-muted: {{.Site.Skin.TextMuted}};
-            --bg-primary: {{.Site.Skin.BgPrimary}};
-            --bg-secondary: {{.Site.Skin.BgSecondary}};
-            --bg-accent: {{.Site.Skin.BgAccent}};
-            --border-light: {{.Site.Skin.BorderLight}};
-            --header-bg: {{.Site.Skin.HeaderBg}};
-            --theme-btn-hover-bg: {{.Site.Skin.ThemeBtnHoverBg}};
-            --theme-btn-active-bg: {{.Site.Skin.ThemeBtnActiveBg}};
-            --radius: {{.Site.Skin.Radius}};
-            --layout-container-max: {{.Site.Skin.LayoutContainerMax}};
-            --layout-container-pad: {{.Site.Skin.LayoutContainerPad}};
-            --layout-column-gap: {{.Site.Skin.LayoutColumnGap}};
-            --layout-page-padding: {{.Site.Skin.LayoutPagePadding}};
-            --layout-post-padding: {{.Site.Skin.LayoutPostPadding}};
-            --layout-widget-padding: {{.Site.Skin.LayoutWidgetPadding}};
-        }
-    </style>
+    {{template "_skin-vars.html" .}}
     <style>
         .comment-list .comment-list {
             margin-top: 16px;

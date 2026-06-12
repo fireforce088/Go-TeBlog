@@ -1,7 +1,7 @@
 services:
   go-teblog:
     build: .
-    image: go-teblog:v0.0.12
+    image: go-teblog:v0.1.0
     container_name: go-teblog
     restart: unless-stopped
     ports:

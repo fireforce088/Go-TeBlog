@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.1.0 - 2026-06-12
+
+### Added
+
+- **公共 `skin.go` 模块**: `SkinConfig` 结构体、3 个校验函数（`sanitizeThemeName`、`sanitizeSkinColor`、`sanitizeSkinLength`）、3 个正则表达式从 `main.go` 和 `admin.go` 合并到公共文件 `skin.go`，消除重复定义。
+- **`_skin-vars.html` 模板片段**: 前台 4 个页面模板（`post.html`、`index.html`、`error.html`、`category_password.html`）中重复的 CSS 变量块提取为公共片段，统一通过 `{{template "_skin-vars.html" .}}` 引用。
+- **构建脚本更新**: `Dockerfile` 和 `build.sh` 的编译命令中追加 `./skin.go`，确保两个 binary 均包含新模块。
+
+### Changed
+
+- **皮肤 CSS 变量仅作用于亮色模式**: 移除原 `:root[data-theme='dark']` 中应用亮色配置值的问题代码，暗色模式下回退到 `style.css` 的静态暗色默认值。得益于 CSS 特异性差异（`:root[data-theme='dark']` 特异性 0-1-0 > `:root` 的 0-0-1），style.css 中的暗色值正确覆盖动态亮色注入。
+
+### Security
+
+- **颜色值逐个校验注入**: 每个颜色配置项经 `sanitizeSkinColor()` 正则验证（支持 `#RGB`、`#RRGGBB`、`#RRGGBBAA`、`rgb()`、`rgba()`、`hsl()`、`hsla()`、合法 CSS 变量引用），非法值回退为默认值。不再对整段 CSS 使用 `template.CSS()`。
+
+### Removed
+
+- `main.go` 和 `admin.go` 中各删除 23 行重复的 `SkinConfig` 结构体定义 + 3 个 sanitize 函数定义（共 −118 行 Go 代码）。
+- 4 个模板文件中删除重复的 `<style>:root, :root[data-theme='dark'] { ... }</style>` 块（共 −95 行模板代码）。
+- 总计净删约 −199 行代码（9 文件修改 + 2 文件新增）。
+
 ## 0.0.12 - 2026-06-12
 
 ### Fixed

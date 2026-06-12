@@ -31,12 +31,9 @@ import (
 )
 
 var (
-	isBackingUp          bool
-	backupMutex          sync.Mutex
-	systemTimeLocation   = time.Local
-	skinThemeNamePattern = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
-	skinColorPattern     = regexp.MustCompile(`(?i)^(#[0-9a-f]{3}|#[0-9a-f]{6}|#[0-9a-f]{8}|rgba?\([0-9.,%\s/+-]+\)|hsla?\([0-9.,%\s/+-]+\)|transparent|inherit|initial|unset|currentColor|[a-z]+)$`)
-	skinLengthPattern    = regexp.MustCompile(`(?i)^(0|[0-9]+(?:\.[0-9]+)?)(px|rem|em|vw|vh|%)?$`)
+	isBackingUp        bool
+	backupMutex        sync.Mutex
+	systemTimeLocation = time.Local
 )
 
 type cloudflareAccessLogItem struct {
@@ -49,31 +46,6 @@ type cloudflareAccessLogItem struct {
 type cfBlockedIPRule struct {
 	IP     string `json:"ip"`
 	RuleID string `json:"rule_id"`
-}
-
-type SkinConfig struct {
-	Theme               string
-	ThemeBase           string
-	PrimaryColor        string
-	PrimaryHover        string
-	SuccessColor        string
-	TextPrimary         string
-	TextSecondary       string
-	TextMuted           string
-	BgPrimary           string
-	BgSecondary         string
-	BgAccent            string
-	BorderLight         string
-	HeaderBg            string
-	ThemeBtnHoverBg     string
-	ThemeBtnActiveBg    string
-	Radius              string
-	LayoutContainerMax  string
-	LayoutContainerPad  string
-	LayoutColumnGap     string
-	LayoutPagePadding   string
-	LayoutPostPadding   string
-	LayoutWidgetPadding string
 }
 
 func getSkinConfig(db *sql.DB) SkinConfig {
@@ -102,34 +74,6 @@ func getSkinConfig(db *sql.DB) SkinConfig {
 		LayoutPostPadding:   sanitizeSkinLength(getOption(db, "layoutPostPadding", "32px"), "32px"),
 		LayoutWidgetPadding: sanitizeSkinLength(getOption(db, "layoutWidgetPadding", "16px"), "16px"),
 	}
-}
-
-func sanitizeThemeName(value, fallback string) string {
-	value = strings.TrimSpace(value)
-	if value == "" || !skinThemeNamePattern.MatchString(value) {
-		return fallback
-	}
-	return value
-}
-
-func sanitizeSkinColor(value, fallback string) string {
-	value = strings.TrimSpace(value)
-	if value == "" || !skinColorPattern.MatchString(value) {
-		return fallback
-	}
-	return value
-}
-
-func sanitizeSkinLength(value, fallback string) string {
-	value = strings.TrimSpace(value)
-	match := skinLengthPattern.FindStringSubmatch(value)
-	if match == nil {
-		return fallback
-	}
-	if match[1] == "0" || match[2] != "" {
-		return strings.ToLower(value)
-	}
-	return match[1] + "px"
 }
 
 func ensureCategoryProtectionColumnsAdmin(db *sql.DB) {

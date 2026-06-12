@@ -25,25 +25,7 @@
     <link rel="stylesheet" href="{{.Site.ThemeBase}}/style.css">
     <link rel="stylesheet" href="{{.Site.ThemeBase}}/go-custom.css">
     <link rel="stylesheet" href="{{.Site.ThemeBase}}/css/font-awesome.min.css">
-    <style>
-        :root,
-        :root[data-theme='dark'] {
-            --primary-color: {{.Site.Skin.PrimaryColor}};
-            --primary-hover: {{.Site.Skin.PrimaryHover}};
-            --success-color: {{.Site.Skin.SuccessColor}};
-            --text-primary: {{.Site.Skin.TextPrimary}};
-            --text-secondary: {{.Site.Skin.TextSecondary}};
-            --text-muted: {{.Site.Skin.TextMuted}};
-            --bg-primary: {{.Site.Skin.BgPrimary}};
-            --bg-secondary: {{.Site.Skin.BgSecondary}};
-            --bg-accent: {{.Site.Skin.BgAccent}};
-            --border-light: {{.Site.Skin.BorderLight}};
-            --header-bg: {{.Site.Skin.HeaderBg}};
-            --theme-btn-hover-bg: {{.Site.Skin.ThemeBtnHoverBg}};
-            --theme-btn-active-bg: {{.Site.Skin.ThemeBtnActiveBg}};
-            --radius: {{.Site.Skin.Radius}};
-        }
-    </style>
+    {{template "_skin-vars.html" .}}
     <style>
         .error-container {
             text-align: center;
