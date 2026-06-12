@@ -37,6 +37,12 @@
             overflow-y: hidden;
             padding: 0.5em 0;
         }
+        .mermaid {
+            overflow-x: auto;
+            overflow-y: hidden;
+            padding: 0.5em 0;
+            text-align: center;
+        }
     </style>
     {{template "_skin-vars.html" .}}
     <style>
@@ -289,6 +295,24 @@
             ],
             throwOnError: false
         });">
+    </script>
+    <!-- Mermaid for diagram rendering -->
+    <script>
+        var mermaidTheme = document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'default';
+        window.mermaid = { startOnLoad: false, theme: mermaidTheme };
+    </script>
+    <script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js" crossorigin="anonymous"></script>
+    <script>
+        // Goldmark renders ```mermaid as <pre><code class="language-mermaid">
+        // Convert to <pre class="mermaid"> which Mermaid recognizes
+        document.querySelectorAll('code.language-mermaid').forEach(function (el) {
+            var pre = document.createElement('pre');
+            pre.className = 'mermaid';
+            pre.textContent = el.textContent;
+            el.parentNode.replaceChild(pre, el);
+        });
+        mermaid.initialize({ startOnLoad: false, theme: mermaidTheme });
+        mermaid.run({ querySelector: '.mermaid' });
     </script>
 </body>
 

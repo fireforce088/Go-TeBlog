@@ -22,6 +22,12 @@
 - 4 个模板文件中删除重复的 `<style>:root, :root[data-theme='dark'] { ... }</style>` 块（共 −95 行模板代码）。
 - 总计净删约 −199 行代码（9 文件修改 + 2 文件新增）。
 
+## 0.1.1 - 2026-06-12
+
+### Added
+
+- **Mermaid 图表渲染**: Mermaid.js v11 CDN 集成，支持在文章中使用 ` ```mermaid ` 代码块渲染流程图、时序图、类图等。Goldmark 渲染后客户端自动将 `<pre><code class="language-mermaid">` 转换为 `<pre class="mermaid">` 并初始化渲染。支持亮色/暗色主题自适应（`data-theme` 属性联动）。仅在 `post.html` 加载 CDN，与 KaTeX 模式一致。
+
 ## 0.0.12 - 2026-06-12
 
 ### Fixed
