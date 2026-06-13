@@ -7,7 +7,7 @@ INIT_ADMIN_PASSWORD="${INIT_ADMIN_PASSWORD:-}"
 RESET_ADMIN_USER="${RESET_ADMIN_USER:-$INIT_ADMIN_USER}"
 RESET_ADMIN_PASSWORD="${RESET_ADMIN_PASSWORD:-}"
 
-mkdir -p "$DATA_DIR/uploads" "$DATA_DIR/backups"
+mkdir -p "$DATA_DIR/uploads" "$DATA_DIR/uploads/images" "$DATA_DIR/backups"
 
 if [ ! -f "$DATA_DIR/uploads/go.mod" ]; then
   {

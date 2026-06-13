@@ -1,0 +1,33 @@
+{
+  "comment": "Go-TeBlog 旅游攻略配图脚本 - 图片来源配置",
+  "_说明": "只需修改 enabled 和 access_key/api_key。Wikimedia Commons 免费免密钥。Unsplash/Pexels 需自行注册获取 API Key（可选）。",
+
+  "sources": {
+    "wikimedia": {
+      "enabled": true,
+      "_说明": "Wikimedia Commons 图片源。免费，无需 API Key，图片均有明确许可信息。默认启用。"
+    },
+    "unsplash": {
+      "enabled": false,
+      "access_key": "YOUR_UNSPLASH_ACCESS_KEY",
+      "_说明": "Unsplash 图片源（可选）。需在 https://unsplash.com/developers 注册应用获取 Access Key。图片为 Unsplash License，可免费商用。"
+    },
+    "pexels": {
+      "enabled": false,
+      "api_key": "YOUR_PEXELS_API_KEY",
+      "_说明": "Pexels 图片源（可选）。需在 https://www.pexels.com/api/ 注册获取 API Key。图片为 Pexels License，可免费商用。"
+    }
+  },
+
+  "confidence_thresholds": {
+    "auto_insert": 70,
+    "candidate_min": 50,
+    "_auto_insert": "置信度 >= 此值的图片自动插入 Markdown 正文",
+    "_candidate_min": "置信度 >= 此值的图片写入候选 JSON，不插入正文",
+    "_低于50": "置信度 < 50 的图片被丢弃，段落标记为 TODO_IMAGE"
+  },
+
+  "max_images_per_paragraph": 3,
+
+  "request_timeout": 15
+}

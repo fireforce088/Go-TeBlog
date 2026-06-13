@@ -16,5 +16,9 @@ services:
       MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-}
       MINIO_BUCKET: ${MINIO_BUCKET:-blog-images}
       MINIO_PUBLIC_URL: ${MINIO_PUBLIC_URL:-}
+      IMAGE_LOCALIZE_ENABLED: "true"
+      IMAGE_LOCALIZE_MAX_SIZE_MB: "10"
+      IMAGE_LOCALIZE_TIMEOUT_SEC: "15"
+      IMAGE_LOCALIZE_DIR: "uploads/images"
     volumes:
       - ./data:/data

@@ -2240,6 +2240,20 @@ func main() {
 		cid := c.PostForm("cid")
 		title := c.PostForm("title")
 		text := c.PostForm("text")
+
+		// 远程图片本地化
+		if IsImageLocalizeEnabled() {
+			localizedText, localizeResults := LocalizeRemoteImages(text)
+			for _, r := range localizeResults {
+				if r.Status == "downloaded" || r.Status == "skipped_duplicate" {
+					log.Printf("[ImageLocalize] %s: %s -> %s (%d bytes)", r.Status, r.OriginalURL, r.LocalPath, r.FileSize)
+				} else {
+					log.Printf("[ImageLocalize] %s: %s (err=%s)", r.Status, r.OriginalURL, r.Error)
+				}
+			}
+			text = localizedText
+		}
+
 		slug := strings.TrimSpace(c.PostForm("slug"))
 		if slug == "" {
 			// 如果 slug 为空，生成一个临时的（后续可能被 CID 替换或保持）

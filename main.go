@@ -693,6 +693,7 @@ func main() {
 	// Serve static files from usr folder
 	r.Static("/usr", "./usr")
 	r.Static("/blog/usr", "./usr")
+	r.Static("/uploads", "./usr/uploads")
 
 	// Fallback to static folder for root-level files
 	r.NoRoute(func(c *gin.Context) {

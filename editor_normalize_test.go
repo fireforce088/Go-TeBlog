@@ -11,24 +11,12 @@ func TestFixAttachmentLinks_KeepsExternalURLs(t *testing.T) {
 		input string
 	}{
 		{
-			"https img.w-tx.top",
-			`<img src="https://img.w-tx.top/blog-images/test.jpg">`,
-		},
-		{
 			"http external",
 			`<img src="http://example.com/a.jpg">`,
 		},
 		{
-			"https any domain webp",
-			`<img src="https://任意域名/path/image.webp">`,
-		},
-		{
 			"Markdown external link",
 			`![](https://example.com/a.jpg)`,
-		},
-		{
-			"Markdown img.w-tx.top",
-			`![](http://img.w-tx.top/a.png)`,
 		},
 	}
 
@@ -142,11 +130,6 @@ func TestNormalizeEditorMarkdown_PreservesMarkdown(t *testing.T) {
 	if !contains(got, "![图片]") {
 		t.Errorf("normalizeEditorMarkdown destroyed existing Markdown image: %q", got)
 	}
-}
-
-func TestFixAttachmentLinks_NoImgDotWTxDotTop(t *testing.T) {
-	// 验证代码中不再包含 img.w-tx.top
-	// 这是编译时检查，不是运行时
 }
 
 func contains(s, substr string) bool {

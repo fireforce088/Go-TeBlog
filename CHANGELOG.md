@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.4 - 2026-06-13
+
+### Added
+
+- **远程图片本地化**: 后台保存文章时自动下载远程 Markdown 图片到本地 `uploads/images/YYYY/MM/` 目录，替换链接为本地路径。新增 `image_localizer.go`。可通过环境变量 `IMAGE_LOCALIZE_ENABLED`（默认 true）、`IMAGE_LOCALIZE_MAX_SIZE_MB`（默认 10）、`IMAGE_LOCALIZE_TIMEOUT_SEC`（默认 15）、`IMAGE_LOCALIZE_DIR`（默认 uploads/images）配置。安全限制：禁止内网 IP、只允许 jpg/png/webp/gif、Content-Type + magic bytes 双重校验。下载失败保留原链接。
+
 ## 0.1.2 - 2026-06-12
 
 ### Added
