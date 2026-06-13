@@ -51,6 +51,9 @@ var allowedExt = map[string]bool{
 // Markdown 图片正则：![alt](url)
 var mdImageRe = regexp.MustCompile(`!\[.*?\]\((https?://[^)\s]+)\)`)
 
+// HTML <img> 标签正则
+var htmlImgRe = regexp.MustCompile(`<img[^>]+src="([^"]+)"[^>]*>`)
+
 func LocalizeRemoteImages(content string) (string, []ImageLocalizeResult) {
 	if !getImageLocalizeEnabled() {
 		return content, nil
@@ -58,17 +61,14 @@ func LocalizeRemoteImages(content string) (string, []ImageLocalizeResult) {
 	var results []ImageLocalizeResult
 	seen := make(map[string]bool) // 去重
 
+	// ---- 第一遍：Markdown 图片 ----
 	localized := mdImageRe.ReplaceAllStringFunc(content, func(match string) string {
-		// Extract URL
 		parts := mdImageRe.FindStringSubmatch(match)
 		if len(parts) < 2 {
 			return match
 		}
 		url := parts[1]
-
-		// 已处理过的同一 URL 直接复用
 		if seen[url] {
-			// Find previous result
 			for _, r := range results {
 				if r.OriginalURL == url && r.LocalPath != "" {
 					alt := extractAlt(match)
@@ -76,16 +76,12 @@ func LocalizeRemoteImages(content string) (string, []ImageLocalizeResult) {
 				}
 			}
 		}
-
-		// 校验 URL
 		if !isAllowedURL(url) {
-			log.Printf("[ImageLocalize] REJECTED %s: blocked URL", url)
+			log.Printf("[ImageLocalize] REJECTED %s", url)
 			results = append(results, ImageLocalizeResult{OriginalURL: url, Status: "rejected", Error: "blocked URL"})
 			seen[url] = true
 			return match
 		}
-
-		// 下载
 		localPath, size, err := downloadImage(url)
 		if err != nil {
 			log.Printf("[ImageLocalize] FAILED %s: %v", url, err)
@@ -93,18 +89,55 @@ func LocalizeRemoteImages(content string) (string, []ImageLocalizeResult) {
 			seen[url] = true
 			return match
 		}
-
 		log.Printf("[ImageLocalize] DOWNLOADED %s -> %s (%d bytes)", url, localPath, size)
 		results = append(results, ImageLocalizeResult{OriginalURL: url, LocalPath: localPath, Status: "downloaded", FileSize: size})
 		seen[url] = true
-
 		alt := extractAlt(match)
 		return fmt.Sprintf("![%s](%s)", alt, localPath)
 	})
 
-	return localized, results
-}
+	// ---- 第二遍：HTML <img> 标签 ----
+	localizedFinal := htmlImgRe.ReplaceAllStringFunc(localized, func(match string) string {
+		parts := htmlImgRe.FindStringSubmatch(match)
+		if len(parts) < 2 {
+			return match
+		}
+		url := parts[1]
+		if seen[url] {
+			for _, r := range results {
+				if r.OriginalURL == url && r.LocalPath != "" {
+					return strings.Replace(match, url, r.LocalPath, 1)
+				}
+			}
+			return match
+		}
+		// 已是本地/MinIO 路径，跳过
+		if strings.HasPrefix(url, "/") || strings.HasPrefix(url, "./") || strings.HasPrefix(url, "../") ||
+			strings.HasPrefix(url, "data:") || strings.Contains(url, "img.w-tx.top") {
+			seen[url] = true
+			return match
+		}
+		if !isAllowedURL(url) {
+			log.Printf("[ImageLocalize] REJECTED <img> %s", url)
+			results = append(results, ImageLocalizeResult{OriginalURL: url, Status: "rejected", Error: "blocked URL"})
+			seen[url] = true
+			return match
+		}
+		localPath, size, err := downloadImage(url)
+		if err != nil {
+			log.Printf("[ImageLocalize] FAILED <img> %s: %v", url, err)
+			results = append(results, ImageLocalizeResult{OriginalURL: url, Status: "failed", Error: err.Error()})
+			seen[url] = true
+			return match
+		}
+		log.Printf("[ImageLocalize] DOWNLOADED <img> %s -> %s (%d bytes)", url, localPath, size)
+		results = append(results, ImageLocalizeResult{OriginalURL: url, LocalPath: localPath, Status: "downloaded", FileSize: size})
+		seen[url] = true
+		return strings.Replace(match, url, localPath, 1)
+	})
 
+	return localizedFinal, results
+}
 func isAllowedURL(rawURL string) bool {
 	// Must be http or https
 	if !strings.HasPrefix(rawURL, "http://") && !strings.HasPrefix(rawURL, "https://") {

@@ -1,10 +1,30 @@
 # Changelog
 
+## 0.1.5 - 2026-06-13
+
+### Added
+
+- **远程图片搜索替换**: 新增 `image_searcher.go`，后台保存文章时对下载失败的远程图片自动搜索 Wikimedia Commons 替换。新增 `cmd/img-fixer/` HK-CN2 Worker，在港区 VPS 上执行 Commons 搜索 → 下载 → MinIO 上传，通过 Tailscale HTTP API 供博客端调用。新增环境变量 `IMAGE_SEARCH_ENABLED`（默认 true）、`IMAGE_SEARCH_WORKER_URL`（Worker 端点）。
+- **HTML `<img>` 标签支持**: `image_localizer.go` 新增 HTML `<img src="">` 图片标签处理（原仅支持 Markdown `![]()`），保存文章时自动下载 HTML 图片到本地存储。
+
+### Architecture
+
+- **HK-CN2 Image Fixer Worker**: 独立 Go 二进制（`cmd/img-fixer/main.go`），监听 `:8900`，提供 `POST /search` API。通过 systemd 管理，使用 `mc` CLI 上传到本地 MinIO。
+- **Tailscale 桥接**: xm-50 博客容器通过 Tailscale（100.119.183.123:8900）调用 HK-CN2 Worker，突破 GFW 对 Wikimedia 的封锁。
+
 ## 0.1.4 - 2026-06-13
 
 ### Added
 
 - **远程图片本地化**: 后台保存文章时自动下载远程 Markdown 图片到本地 `uploads/images/YYYY/MM/` 目录，替换链接为本地路径。新增 `image_localizer.go`。可通过环境变量 `IMAGE_LOCALIZE_ENABLED`（默认 true）、`IMAGE_LOCALIZE_MAX_SIZE_MB`（默认 10）、`IMAGE_LOCALIZE_TIMEOUT_SEC`（默认 15）、`IMAGE_LOCALIZE_DIR`（默认 uploads/images）配置。安全限制：禁止内网 IP、只允许 jpg/png/webp/gif、Content-Type + magic bytes 双重校验。下载失败保留原链接。
+
+## 0.1.3 - 2026-06-12
+
+### Removed
+
+- **Cloudflare 五秒盾**: 移除项目内置的 Cloudflare 五秒盾/访问防护功能。包括：自动安全等级切换、IP 自动拉黑、流量阈值检测、五秒盾中间件、相关路由、数据库表、设置页面配置项、仪表盘日志面板。外部 Cloudflare Tunnel/Access 不受影响。
+- **AI 评论检测**: 移除 AI 评论垃圾检测和 AI 攻击类型分析功能。包括：评论提交时的 AI 评分、AI 测试接口、AI 系统设置配置项、所有相关后台函数（checkSpamAI、callAIChatCompletionText、extractSpamScore 等）。普通评论审核功能保留。
+- **文档清理**: README.md 和 PROJECT_GUIDE.md 中相关功能描述已删除。
 
 ## 0.1.2 - 2026-06-12
 
@@ -45,13 +65,6 @@
 
 - `main.go` 和 `admin.go` 中各删除 23 行重复的 `SkinConfig` 结构体定义 + 3 个 sanitize 函数定义（共 −118 行 Go 代码）。
 - 4 个模板文件中删除重复的 `<style>:root, :root[data-theme='dark'] { ... }</style>` 块（共 −95 行模板代码）。
-- 总计净删约 −199 行代码（9 文件修改 + 2 文件新增）。
-
-## 0.1.1 - 2026-06-12
-
-### Added
-
-- **Mermaid 图表渲染**: Mermaid.js v11 CDN 集成，支持在文章中使用 ` ```mermaid ` 代码块渲染流程图、时序图、类图等。Goldmark 渲染后客户端自动将 `<pre><code class="language-mermaid">` 转换为 `<pre class="mermaid">` 并初始化渲染。支持亮色/暗色主题自适应（`data-theme` 属性联动）。仅在 `post.html` 加载 CDN，与 KaTeX 模式一致。
 
 ## 0.0.12 - 2026-06-12
 
@@ -215,10 +228,4 @@
 - Changed the frontend-to-admin proxy target to `127.0.0.1:8191` for local dual-process and Docker runtime compatibility.
 - Fixed frontend template year rendering.
 
-## 0.1.3 - 2026-06-12
 
-### Removed
-
-- **Cloudflare 五秒盾**: 移除项目内置的 Cloudflare 五秒盾/访问防护功能。包括：自动安全等级切换、IP 自动拉黑、流量阈值检测、五秒盾中间件、相关路由、数据库表、设置页面配置项、仪表盘日志面板。外部 Cloudflare Tunnel/Access 不受影响。
-- **AI 评论检测**: 移除 AI 评论垃圾检测和 AI 攻击类型分析功能。包括：评论提交时的 AI 评分、AI 测试接口、AI 系统设置配置项、所有相关后台函数（checkSpamAI、callAIChatCompletionText、extractSpamScore 等）。普通评论审核功能保留。
-- **文档清理**: README.md 和 PROJECT_GUIDE.md 中相关功能描述已删除。

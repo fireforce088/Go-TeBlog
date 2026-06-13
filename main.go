@@ -501,8 +501,20 @@ func handleBeacon(c *gin.Context) {
 // unwrapHTMLImages 在 goldmark.Convert 之前，
 // 把 <p align="center">![alt](url)</p> 这种 HTML 包裹的 Markdown 图片解包成纯 Markdown 格式
 func unwrapHTMLImages(content string) string {
+	// 处理 Markdown 格式：<p align="center">![alt](url)</p>
 	re := regexp.MustCompile(`<p\s+align="center">(\s*!\[[^\]]*\]\([^)]+\))\s*</p>`)
-	return re.ReplaceAllString(content, "$1")
+	content = re.ReplaceAllString(content, "$1")
+
+	// 处理 HTML <img> 格式（兼容无引号属性）：
+	// <p align=center>
+	// <img src=url width=80%><br>
+	// <em>caption</em>
+	// </p>
+	// 转换为 ![caption](url)
+	htmlImgRe := regexp.MustCompile(`(?i)<p\s+align\s*=\s*"?center"?>\s*<img\s+[^>]*src\s*=\s*"?([^"\s>]+)"?[^>]*>(?:\s*<br>\s*<em>([^<]*)</em>)?\s*</p>`)
+	content = htmlImgRe.ReplaceAllString(content, "![$2]($1)")
+
+	return content
 }
 
 // protectLatexUnderscores 在 goldmark.Convert 之前，

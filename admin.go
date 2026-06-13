@@ -2241,15 +2241,11 @@ func main() {
 		title := c.PostForm("title")
 		text := c.PostForm("text")
 
-		// 远程图片本地化
-		if IsImageLocalizeEnabled() {
-			localizedText, localizeResults := LocalizeRemoteImages(text)
-			for _, r := range localizeResults {
-				if r.Status == "downloaded" || r.Status == "skipped_duplicate" {
-					log.Printf("[ImageLocalize] %s: %s -> %s (%d bytes)", r.Status, r.OriginalURL, r.LocalPath, r.FileSize)
-				} else {
-					log.Printf("[ImageLocalize] %s: %s (err=%s)", r.Status, r.OriginalURL, r.Error)
-				}
+		// 远程图片本地化 + Commons 搜索替换
+		if IsImageLocalizeEnabled() || ImageSearcherEnabled() {
+			localizedText, allResults := FixAndLocalizeImages(text)
+			for _, r := range allResults {
+				log.Printf("[ImageFix] result: %+v", r)
 			}
 			text = localizedText
 		}

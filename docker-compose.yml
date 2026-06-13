@@ -1,7 +1,7 @@
 services:
   go-teblog:
     build: .
-    image: go-teblog:v0.1.4
+    image: go-teblog:v0.1.5
     container_name: go-teblog
     restart: unless-stopped
     ports:
@@ -20,5 +20,7 @@ services:
       IMAGE_LOCALIZE_MAX_SIZE_MB: "10"
       IMAGE_LOCALIZE_TIMEOUT_SEC: "15"
       IMAGE_LOCALIZE_DIR: "uploads/images"
+      IMAGE_SEARCH_ENABLED: "true"
+      IMAGE_SEARCH_WORKER_URL: "http://100.119.183.123:8900"
     volumes:
       - ./data:/data
