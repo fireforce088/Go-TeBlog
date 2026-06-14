@@ -707,6 +707,9 @@ func main() {
 	r.Static("/blog/usr", "./usr")
 	r.Static("/uploads", "./usr/uploads")
 
+	// Serve /blog-images/ from persistent data volume
+	r.Static("/blog-images", "/data/blog-images")
+
 	// Fallback to static folder for root-level files
 	r.NoRoute(func(c *gin.Context) {
 		path := c.Request.URL.Path

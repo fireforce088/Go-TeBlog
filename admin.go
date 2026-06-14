@@ -22,6 +22,8 @@ import (
 	"sync"
 	"time"
 
+	"typecho-go-server/internal/image"
+
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"golang.org/x/crypto/bcrypt"
@@ -802,36 +804,36 @@ func main() {
 		group, _ := c.Get("userGroup")
 
 		c.HTML(http.StatusOK, "admin_settings.html", gin.H{
-			"Username":                   username,
-			"UserGroup":                  group,
-			"Tab":                        "settings",
-			"ActiveSection":              activeSection,
-			"AdminPath":                  adminPath,
-			"Skin":                       getSkinConfig(db),
-			"SiteTitle":                  getOption(db, "title", "我的博客"),
-			"SiteDescription":            getOption(db, "description", "基于 Go 语言的极速博客系统"),
-			"SiteUrl":                    getOption(db, "siteUrl", "http://localhost:8190"),
-			"Timezone":                   normalizeTimezoneOption(getOption(db, "timezone", "Asia/Shanghai")),
-			"ConfigAdminPath":            getOption(db, "adminPath", "admin"),
-			"FrontendServiceName":        getOption(db, "frontendServiceName", "blog"),
-			"AdminServiceName":           getOption(db, "adminServiceName", "blogadmin"),
-			"SessionTimeout":             getOption(db, "sessionTimeout", "30"),
-			"SiteKeywords":               getOption(db, "keywords", ""),
-			"FooterCode":                 getOption(db, "footerCode", ""),
-			"PageSize":                   getOption(db, "pageSize", "10"),
-			"RecentPostsSize":            getOption(db, "recentPostsSize", "15"),
-			"RecentCommentsSize":         getOption(db, "recentCommentsSize", "10"),
-			"ShowDateArchives":           getOption(db, "showDateArchives", "1"),
-			"DateArchivesSize":           getOption(db, "dateArchivesSize", "12"),
-			"DefaultCategory":            getOption(db, "defaultCategory", "1"),
-			"CommentAudit":               getOption(db, "commentAudit", "0"),
-			"StatsBufferSize":            getOption(db, "statsBufferSize", "100"),
-			"LogRetentionDays":           getOption(db, "logRetentionDays", "30"),
-			"CommentLimitIP":             getOption(db, "commentLimitIP", "1"),
-			"CommentLimitGlobal":         getOption(db, "commentLimitGlobal", "2"),
-			"CommentsEnabled":            getOption(db, "commentsEnabled", "1"),
-			"AllCategories":              categories,
-			"SuccessMessage":             successMessage,
+			"Username":            username,
+			"UserGroup":           group,
+			"Tab":                 "settings",
+			"ActiveSection":       activeSection,
+			"AdminPath":           adminPath,
+			"Skin":                getSkinConfig(db),
+			"SiteTitle":           getOption(db, "title", "我的博客"),
+			"SiteDescription":     getOption(db, "description", "基于 Go 语言的极速博客系统"),
+			"SiteUrl":             getOption(db, "siteUrl", "http://localhost:8190"),
+			"Timezone":            normalizeTimezoneOption(getOption(db, "timezone", "Asia/Shanghai")),
+			"ConfigAdminPath":     getOption(db, "adminPath", "admin"),
+			"FrontendServiceName": getOption(db, "frontendServiceName", "blog"),
+			"AdminServiceName":    getOption(db, "adminServiceName", "blogadmin"),
+			"SessionTimeout":      getOption(db, "sessionTimeout", "30"),
+			"SiteKeywords":        getOption(db, "keywords", ""),
+			"FooterCode":          getOption(db, "footerCode", ""),
+			"PageSize":            getOption(db, "pageSize", "10"),
+			"RecentPostsSize":     getOption(db, "recentPostsSize", "15"),
+			"RecentCommentsSize":  getOption(db, "recentCommentsSize", "10"),
+			"ShowDateArchives":    getOption(db, "showDateArchives", "1"),
+			"DateArchivesSize":    getOption(db, "dateArchivesSize", "12"),
+			"DefaultCategory":     getOption(db, "defaultCategory", "1"),
+			"CommentAudit":        getOption(db, "commentAudit", "0"),
+			"StatsBufferSize":     getOption(db, "statsBufferSize", "100"),
+			"LogRetentionDays":    getOption(db, "logRetentionDays", "30"),
+			"CommentLimitIP":      getOption(db, "commentLimitIP", "1"),
+			"CommentLimitGlobal":  getOption(db, "commentLimitGlobal", "2"),
+			"CommentsEnabled":     getOption(db, "commentsEnabled", "1"),
+			"AllCategories":       categories,
+			"SuccessMessage":      successMessage,
 		})
 	}
 
@@ -2241,13 +2243,11 @@ func main() {
 		title := c.PostForm("title")
 		text := c.PostForm("text")
 
-		// 远程图片本地化 + Commons 搜索替换
-		if IsImageLocalizeEnabled() || ImageSearcherEnabled() {
-			localizedText, allResults := FixAndLocalizeImages(text)
-			for _, r := range allResults {
-				log.Printf("[ImageFix] result: %+v", r)
-			}
-			text = localizedText
+		text, imageResult := image.ProcessContent(c.Request.Context(), text)
+		log.Printf("[ImageLocalize] summary: total=%d unique=%d localized=%d failed=%d skipped=%d",
+			imageResult.Localize.Total, imageResult.Localize.Unique, imageResult.Localize.Localized, imageResult.Localize.Failed, imageResult.Localize.Skipped)
+		for _, r := range imageResult.Search {
+			log.Printf("[ImageSearch] result: %+v", r)
 		}
 
 		slug := strings.TrimSpace(c.PostForm("slug"))
@@ -2327,7 +2327,7 @@ func main() {
 			}
 		}
 
-		c.Redirect(http.StatusFound, ""+adminPath+"/edit/"+finalCid+"?msg=saved")
+		c.Redirect(http.StatusFound, ""+adminPath+"/edit/"+finalCid+"?msg=saved&localized="+strconv.Itoa(imageResult.Localize.Localized)+"&failed="+strconv.Itoa(imageResult.Localize.Failed))
 
 		// Update categories
 		categories := c.PostFormArray("categories")

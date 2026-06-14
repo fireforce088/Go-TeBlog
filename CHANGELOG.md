@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.1.7 - 2026-06-14
+
+### Added
+
+- **统一图片处理包**: 将 `image_localizer.go`、`image_searcher.go` 整合为 `internal/image/` 包，包含统一配置（`config.go`）、本地化（`localizer.go`）、SSRF防护（`security.go`）、存储（`storage.go`）、Markdown/HTML 解析（`parser.go`）、在线搜索替换（`searcher.go`）、整合入口（`searchfix.go`）。对外只暴露 `image.ProcessContent()`, 先本地化再搜索替换。
+
+### Changed
+
+- **存储路径更改**: 图片保存路径从 `./usr/uploads/article-images/` 改为 `/data/blog-images/`，公开 URL 前缀从 `/usr/uploads/` 改为 `/blog-images/`。宿主机对应路径 `/vol1/1000/Docker/Go-Blog/blog-images/`。
+- **`admin.go` POST /save**: 改用 `image.ProcessContent(ctx, text)` 统一入口，替代 `ImageLocalizer.Localize()` + `FixArticleImages()` 的分别调用。
+- **Dockerfile/build.sh**: 移除逐文件构建列表，适配新包结构。
+- **`scripts/travel_image_picker.py`**: 新增 `--download-dir` 参数，支持下载选中图片到本地 `blog-images/` 目录并替换输出中的远程 URL 为本地路径，默认目录 `/vol1/1000/Docker/Go-Blog/blog-images/`。
+- **`proxyapps` 用户**: 创建专用 UID 986 用于透明代理，TPROXY 规则已验证通过。普通用户直连，proxyapps 用户走代理（`82.152.91.229`）。
+
+### Removed
+
+- 根目录 `image_localizer.go`、`image_searcher.go`（已迁入 `internal/image/`）。
+- `LocalizeRemoteImages()`、`FixAndLocalizeImages()`（被 `image.ProcessContent()` 替代）。
+
 ## 0.1.5 - 2026-06-13
 
 ### Added

@@ -15,12 +15,14 @@ Go-TeBlog 旅游攻略自动配图预处理脚本
 """
 
 import argparse
+import hashlib
 import json
 import os
 import re
 import sys
 import traceback
 from dataclasses import dataclass, field, asdict
+from pathlib import Path
 from typing import Optional
 from urllib.parse import quote, urlencode
 
@@ -73,7 +75,7 @@ class WikimediaProvider(ImageProvider):
     }
 
     def _get(self, params: dict) -> requests.Response:
-        return requests.get(self.COMMONS_API, params=params, headers=self.HEADERS, timeout=8)
+        return requests.get(self.COMMONS_API, params=params, headers=self.HEADERS, timeout=15)
 
     def search(self, query: str, place: str, max_results: int = 5) -> list[ImageCandidate]:
         candidates = []
@@ -501,6 +503,70 @@ def generate_query(para: ParagraphInfo, found_places: dict[str, set[str]]) -> tu
     return heading, heading
 
 
+# ─── 图片下载 ────────────────────────────────────────────────
+
+
+def download_image(image_url: str, download_dir: str) -> tuple[str, str]:
+    """下载远程图片到本地目录，返回 (local_path, local_url_path)。
+
+    参数：
+        image_url: 远程图片 URL（如 Wikimedia Commons 链接）
+        download_dir: 下载目标目录（如 /vol1/1000/Docker/Go-Blog/blog-images/）
+
+    返回：
+        (local_file_path, local_url_path)
+        示例: ("/data/blog-images/ab12cd34.jpg", "/blog-images/ab12cd34.jpg")
+
+    异常时抛出。
+    """
+    os.makedirs(download_dir, exist_ok=True)
+
+    # 用 URL 的 SHA256 前缀作为文件名，去重
+    url_hash = hashlib.sha256(image_url.encode()).hexdigest()[:8]
+    ext = os.path.splitext(image_url)[1] or ".jpg"
+    filename = f"{url_hash}{ext}"
+    local_path = os.path.join(download_dir, filename)
+
+    # 已存在则跳过
+    if os.path.exists(local_path):
+        return local_path, f"/blog-images/{filename}"
+
+    # 下载
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    }
+    resp = requests.get(image_url, headers=headers, timeout=30, stream=True)
+    resp.raise_for_status()
+
+    with open(local_path, "wb") as f:
+        for chunk in resp.iter_content(chunk_size=8192):
+            f.write(chunk)
+
+    return local_path, f"/blog-images/{filename}"
+
+
+def download_chosen_images(paragraphs: list, download_dir: str, verbose: bool = False) -> int:
+    """下载所有选中配图到本地目录，并更新 ImageCandidate 的 image_url 为本地路径。
+
+    返回：成功下载/已存在的图片数量。
+    """
+    count = 0
+    for para in paragraphs:
+        if not para.chosen_image:
+            continue
+        try:
+            local_path, local_url = download_image(para.chosen_image.image_url, download_dir)
+            para.chosen_image.image_url = local_url
+            count += 1
+            if verbose:
+                print(f"  [DOWNLOAD] {local_path}")
+        except Exception as e:
+            if verbose:
+                print(f"  [WARN] 下载失败 {para.chosen_image.image_url[:60]}...: {e}")
+            # 下载失败则保持远程 URL 不变
+    return count
+
+
 # ─── 主流程 ──────────────────────────────────────────────────
 
 
@@ -553,7 +619,7 @@ def build_providers(config: dict) -> list[ImageProvider]:
     return providers
 
 
-def process_markdown(input_path: str, config: dict) -> dict:
+def process_markdown(input_path: str, config: dict, download_dir: str = "") -> dict:
     """主处理函数。返回处理结果字典。"""
     with open(input_path, encoding="utf-8") as f:
         markdown_text = f.read()
@@ -663,6 +729,11 @@ def process_markdown(input_path: str, config: dict) -> dict:
             total_candidate += 1
         else:
             total_todo += 1
+
+    # Step 4.5: Download chosen images to local
+    total_downloaded = 0
+    if download_dir:
+        total_downloaded = download_chosen_images(paragraphs, download_dir, verbose=False)
 
     # Step 5: Generate output markdown with images
     output_lines = []
@@ -841,6 +912,7 @@ def process_markdown(input_path: str, config: dict) -> dict:
         "output_report": output_report,
         "paragraphs_searched": total_searched,
         "auto_inserted": total_auto,
+        "downloaded": total_downloaded,
         "candidates": total_candidate,
         "todo_manual": total_todo,
         "found_places": {k: list(v) for k, v in found_places.items()},
@@ -863,6 +935,8 @@ def main():
     parser.add_argument("--config", "-c", default="",
                         help="图片来源配置文件路径（可选，默认仅启用 Wikimedia Commons）")
     parser.add_argument("--verbose", "-v", action="store_true", help="详细输出")
+    parser.add_argument("--download-dir", "-d", default="/vol1/1000/Docker/Go-Blog/blog-images",
+                        help="下载图片到本地目录（如 /vol1/1000/Docker/Go-Blog/blog-images/），并替换输出中的远程 URL 为本地路径")
     args = parser.parse_args()
 
     if not os.path.exists(args.input):
@@ -876,7 +950,7 @@ def main():
         print(f"  自动插入阈值 = {config['confidence_thresholds']['auto_insert']}")
         print(f"  候选阈值 = {config['confidence_thresholds']['candidate_min']}")
 
-    result = process_markdown(args.input, config)
+    result = process_markdown(args.input, config, args.download_dir)
 
     print(f"\n处理完成：{os.path.basename(args.input)}")
     print(f"  输出文件（3个）：")
@@ -885,6 +959,8 @@ def main():
     print(f"    📊 {os.path.basename(result['output_report'])}")
     print(f"  地点识别：{result['found_places']}")
     print(f"  自动插入图片：{result['auto_inserted']} 张")
+    if result['downloaded']:
+        print(f"  ⬇️  已下载到本地：{result['downloaded']} 张")
     print(f"  低置信度候选：{result['candidates']} 张")
     print(f"  需人工确认段落：{result['todo_manual']} 处")
 

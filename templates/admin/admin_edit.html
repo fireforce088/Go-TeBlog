@@ -600,10 +600,21 @@
             const urlParams = new URLSearchParams(window.location.search);
             if (urlParams.get('msg') === 'saved') {
                 const toast = document.getElementById('toast');
+                const localized = Number.parseInt(urlParams.get('localized') || '0', 10);
+                const failed = Number.parseInt(urlParams.get('failed') || '0', 10);
+                if (localized > 0 || failed > 0) {
+                    toast.textContent = `文章已保存：${localized} 张远程图片已本地化，${failed} 张失败（详情见服务器日志）`;
+                } else {
+                    toast.textContent = '保存成功！';
+                }
                 toast.classList.add('show');
                 setTimeout(() => {
                     toast.classList.remove('show');
-                    window.history.replaceState({}, document.title, window.location.pathname);
+                    urlParams.delete('msg');
+                    urlParams.delete('localized');
+                    urlParams.delete('failed');
+                    const query = urlParams.toString();
+                    window.history.replaceState({}, document.title, window.location.pathname + (query ? '?' + query : ''));
                 }, 3000);
             }
         }
