@@ -54,7 +54,7 @@ body {
     font-size: 15px;
     line-height: 1.7;
     margin: 0;
-    padding: var(--layout-page-padding) 0;
+    padding: 0 0 var(--layout-page-padding);
 }
 
 a {
@@ -200,7 +200,7 @@ textarea {
 
 
 #header {
-    padding: var(--layout-page-padding) 0;
+    padding: 10px 0;
     border-bottom: 1px solid var(--border-light);
     background: var(--header-bg);
     backdrop-filter: blur(10px);
@@ -1365,8 +1365,8 @@ img.alignright {
 /* Frontend wide three-column layout */
 .home-profile-bar {
     background: var(--bg-primary);
-    border-bottom: 1px solid var(--border-light);
-    padding: 8px 0;
+    border-bottom: none;
+    padding: 6px 0;
     font-size: 13px;
     line-height: 1;
 }
