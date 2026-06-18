@@ -24,10 +24,10 @@
     <title>{{if .SearchQuery}}包含关键字 {{.SearchQuery}} 的文章 - {{end}}{{.Site.Title}}</title>
     {{if .Site.Keywords}}
     <meta name="keywords" content="{{.Site.Keywords}}">{{end}}
-    <link rel="stylesheet" href="{{.Site.ThemeBase}}/normalize.css">
-    <link rel="stylesheet" href="{{.Site.ThemeBase}}/grid.css">
-    <link rel="stylesheet" href="{{.Site.ThemeBase}}/style.css">
-    <link rel="stylesheet" href="{{.Site.ThemeBase}}/go-custom.css">
+    <link rel="stylesheet" href="{{.Site.ThemeBase}}/normalize.css?v=2">
+    <link rel="stylesheet" href="{{.Site.ThemeBase}}/grid.css?v=2">
+    <link rel="stylesheet" href="{{.Site.ThemeBase}}/style.css?v=2">
+    <link rel="stylesheet" href="{{.Site.ThemeBase}}/go-custom.css?v=2">
     <link rel="stylesheet" href="{{.Site.ThemeBase}}/css/font-awesome.min.css">
     {{template "_skin-vars.html" .}}
     <style>
@@ -90,16 +90,20 @@
 
     <div id="body">
         <div class="container">
+
+            <div class="home-profile-bar">
+                <div class="home-profile-bar-inner">
+                    <h1 class="home-site-title"><a href="/blog">{{.Site.Title}}</a></h1>
+                    {{if .Site.Description}}
+                    <p class="home-site-description">{{.Site.Description}}</p>
+                    {{end}}
+                </div>
+            </div>
+
             <div class="home-layout">
 
                 <aside class="home-left" role="complementary">
                     <div class="home-left-inner">
-                        <section class="widget home-profile">
-                            <h1 class="home-site-title"><a href="/blog">{{.Site.Title}}</a></h1>
-                            {{if .Site.Description}}
-                            <p class="home-site-description">{{.Site.Description}}</p>
-                            {{end}}
-                        </section>
 
                         <section class="widget home-search-widget">
                             <form class="home-search" method="post" action="/blog/" role="search">
