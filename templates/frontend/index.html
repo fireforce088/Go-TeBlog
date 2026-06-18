@@ -206,7 +206,8 @@
                             </li>
                         </ul>
                         <div class="post-content" itemprop="articleBody">
-                            {{fullContent .}}
+                            {{$excerpt := excerpt . 300}}{{$excerpt}}
+                            {{if gt (len $excerpt) 290}}<p class="more"><a href="{{permalink .}}" title="{{.Title}}">- 阅读剩余部分 -</a></p>{{end}}
                         </div>
                     </article>
                     {{else}}

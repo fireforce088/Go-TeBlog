@@ -831,6 +831,34 @@ func main() {
 
 			return template.HTML(htmlContent)
 		},
+		"excerpt": func(p Post, maxLen int) string {
+			content := strings.TrimPrefix(p.Text, "<!--markdown-->")
+			content = unwrapHTMLImages(content)
+			content = protectLatexUnderscores(content)
+			parts := strings.Split(content, "<!--more-->")
+			excerpt := parts[0]
+
+			var buf bytes.Buffer
+			if err := mdRenderer.Convert([]byte(excerpt), &buf); err != nil {
+				return strings.TrimSpace(excerpt)
+			}
+
+			htmlContent := fixAttachmentLinks(buf.String())
+			text := regexp.MustCompile(`<[^>]+>`).ReplaceAllString(htmlContent, "")
+			text = strings.ReplaceAll(text, "&nbsp;", " ")
+			text = strings.ReplaceAll(text, "&amp;", "&")
+			text = strings.ReplaceAll(text, "&lt;", "<")
+			text = strings.ReplaceAll(text, "&gt;", ">")
+			text = strings.ReplaceAll(text, "&quot;", "\"")
+			text = strings.ReplaceAll(text, "&#39;", "'")
+			text = strings.TrimSpace(text)
+
+			runes := []rune(text)
+			if len(runes) <= maxLen {
+				return text
+			}
+			return string(runes[:maxLen]) + "..."
+		},
 		"renderMarkdown": func(text string) template.HTML {
 			content := strings.TrimPrefix(text, "<!--markdown-->")
 			content = strings.ReplaceAll(content, "<!--more-->", "")
@@ -2317,5 +2345,3 @@ func getPrevNextPosts(db *sql.DB, created int64) (*Post, *Post) {
 
 	return prev, next
 }
-
-
