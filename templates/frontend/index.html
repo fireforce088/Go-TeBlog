@@ -53,6 +53,15 @@
 
 <body>
 
+    <div class="home-profile-bar">
+        <div class="container home-profile-bar-inner">
+            <h1 class="home-site-title"><a href="/blog">{{.Site.Title}}</a></h1>
+            {{if .Site.Description}}
+            <p class="home-site-description">{{.Site.Description}}</p>
+            {{end}}
+        </div>
+    </div>
+
     <header id="header" class="clearfix">
         <div class="container">
             <div class="site-header">
@@ -90,15 +99,6 @@
 
     <div id="body">
         <div class="container">
-
-            <div class="home-profile-bar">
-                <div class="home-profile-bar-inner">
-                    <h1 class="home-site-title"><a href="/blog">{{.Site.Title}}</a></h1>
-                    {{if .Site.Description}}
-                    <p class="home-site-description">{{.Site.Description}}</p>
-                    {{end}}
-                </div>
-            </div>
 
             <div class="home-layout">
 
